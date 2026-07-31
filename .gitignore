@@ -30,3 +30,12 @@ go.work.sum
 # Editor/IDE
 # .idea/
 # .vscode/
+
+# macOS
+.DS_Store
+
+# CA material must never be committed (second line of defence; the CA lives in
+# ~/.proxysim by default, outside the repo). See CLAUDE.md.
+ca.key
+ca.crt
+.proxysim/
