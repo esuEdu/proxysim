@@ -24,7 +24,7 @@ not all at once.
 | 005 | CONNECT + TLS termination, MITM exclusions | ready |
 | 006 | Body decoding (gzip/deflate/br, chunked) | ready |
 | 007 | `simctl` trust automation | ready |
-| 008 | Desktop UI | not written |
+| 008 | Desktop UI | ready |
 
 Build order is 001 → 002 → 003 → 005. 003 lands before any capture code, since
 both 004 and 005 write into it.
