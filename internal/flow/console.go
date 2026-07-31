@@ -103,21 +103,38 @@ func writeBody(b *strings.Builder, label string, h http.Header, body []byte, tru
 		return
 	}
 
+	// Decode Content-Encoding for display; the stored body stays compressed.
+	decoded, report := Decode(h.Get("Content-Encoding"), body, 0)
+
 	ct := h.Get("Content-Type")
-	if isTextual(ct, body) {
-		fmt.Fprintf(b, "%s (%s):\n", label, humanBytes(len(body)))
-		b.WriteString(renderText(ct, body))
+	if isTextual(ct, decoded) {
+		fmt.Fprintf(b, "%s (%s%s):\n", label, humanBytes(len(decoded)), codingSuffix(report))
+		b.WriteString(renderText(ct, decoded))
 		if !strings.HasSuffix(b.String(), "\n") {
 			b.WriteString("\n")
 		}
 	} else {
 		// Binary content: describe it rather than dumping bytes at the terminal.
-		fmt.Fprintf(b, "%s: <binary %s, %s>\n", label, contentTypeOr(ct, "application/octet-stream"), humanBytes(len(body)))
+		fmt.Fprintf(b, "%s: <binary %s, %s%s>\n", label, contentTypeOr(ct, "application/octet-stream"), humanBytes(len(decoded)), codingSuffix(report))
 	}
 
-	if truncated {
-		fmt.Fprintf(b, "%s  [truncated at %s]\n", label, humanBytes(len(body)))
+	// A partially decodable body and a capture-truncated one are different
+	// facts; show each on its own so neither is mistaken for the other.
+	if report.Partial {
+		fmt.Fprintf(b, "%s  [%s]\n", label, report.Note)
 	}
+	if truncated {
+		fmt.Fprintf(b, "%s  [captured %s, truncated]\n", label, humanBytes(len(body)))
+	}
+}
+
+// codingSuffix annotates a decoded body line with the coding it was decoded
+// from, e.g. " gzip → " sits between the label and the decoded size.
+func codingSuffix(report DecodeReport) string {
+	if !report.Decoded || len(report.Encodings) == 0 {
+		return ""
+	}
+	return ", decoded from " + strings.Join(report.Encodings, ", ")
 }
 
 // renderText pretty-prints JSON bodies and passes other text through verbatim.
