@@ -23,7 +23,7 @@ not all at once.
 | 004 | Plain HTTP forwarding | ready |
 | 005 | CONNECT + TLS termination, MITM exclusions | ready |
 | 006 | Body decoding (gzip/deflate/br, chunked) | ready |
-| 007 | `simctl` trust automation | not written |
+| 007 | `simctl` trust automation | ready |
 | 008 | Desktop UI | not written |
 
 Build order is 001 → 002 → 003 → 005. 003 lands before any capture code, since
