@@ -8,9 +8,12 @@
 package ca
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/pem"
@@ -19,6 +22,7 @@ import (
 	"math/big"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -42,13 +46,23 @@ const (
 	clockSkew = time.Hour
 )
 
-// Authority is a loaded root CA: the certificate presented to callers and the
-// private key used to sign leaves (see spec 002). It is safe to read
-// concurrently; it is immutable after Load returns.
+// Authority is a loaded root CA: the certificate presented to callers, the
+// private key used to sign leaves, and the shared leaf key plus per-host leaf
+// cache from spec 002. The root cert/key/PEM are immutable after Load; the leaf
+// cache is guarded by mu and safe for concurrent use from the request path.
 type Authority struct {
 	cert    *x509.Certificate
 	key     *rsa.PrivateKey
 	certPEM []byte
+
+	// leafKey is a single ECDSA P-256 key reused for every minted leaf.
+	// Generating one keypair per host would add latency to the first
+	// connection to each new domain; reusing one is standard for intercepting
+	// proxies and costs nothing here, as the key never leaves the machine.
+	leafKey *ecdsa.PrivateKey
+
+	mu    sync.RWMutex
+	cache map[string]*tls.Certificate
 }
 
 // Load returns the CA stored in dir, generating and persisting a new one if
@@ -69,16 +83,29 @@ func Load(dir string) (*Authority, error) {
 		return nil, err
 	}
 
+	var a *Authority
 	switch {
 	case crtExists && keyExists:
-		return loadFrom(crtPath, keyPath)
+		a, err = loadFrom(crtPath, keyPath)
 	case !crtExists && !keyExists:
-		return generateInto(dir, crtPath, keyPath)
+		a, err = generateInto(dir, crtPath, keyPath)
 	case crtExists:
 		return nil, fmt.Errorf("ca: found %s without %s: refusing to regenerate and invalidate an installed CA; delete %s to start over", crtName, keyName, crtPath)
 	default:
 		return nil, fmt.Errorf("ca: found %s without %s: refusing to proceed; delete %s to start over", keyName, crtName, keyPath)
 	}
+	if err != nil {
+		return nil, err
+	}
+
+	// The shared leaf key and cache are per-process, not persisted: minting is
+	// sub-millisecond with a reused key, so there is nothing to save on disk.
+	a.leafKey, err = ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return nil, fmt.Errorf("ca: generating shared leaf key: %w", err)
+	}
+	a.cache = make(map[string]*tls.Certificate)
+	return a, nil
 }
 
 // Certificate returns the root certificate, for callers that need to display,
