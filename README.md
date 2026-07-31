@@ -21,7 +21,7 @@ not all at once.
 | 002 | Per-host leaf minting | ready |
 | 003 | Flow model — the engine/UI contract | ready |
 | 004 | Plain HTTP forwarding | ready |
-| 005 | CONNECT + TLS termination, MITM exclusions | not written |
+| 005 | CONNECT + TLS termination, MITM exclusions | ready |
 | 006 | Body decoding (gzip/deflate/br, chunked) | not written |
 | 007 | `simctl` trust automation | not written |
 | 008 | Desktop UI | not written |
