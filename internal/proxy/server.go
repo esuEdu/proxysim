@@ -1,16 +1,20 @@
 // Package proxy forwards proxied HTTP requests and captures each exchange as a
-// flow.Flow. This file implements plain http:// forwarding (spec 004); CONNECT
-// and TLS termination (spec 005) build on the same Server.
+// flow.Flow. server.go implements plain http:// forwarding (spec 004) and the
+// shared request-forwarding core; connect.go adds CONNECT, TLS termination, and
+// the blind-tunnel fallback (spec 005) on the same Server.
 package proxy
 
 import (
 	"bytes"
+	"crypto/tls"
 	"io"
 	"net"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"proxysim/internal/ca"
 	"proxysim/internal/flow"
 )
 
@@ -29,13 +33,26 @@ var hopByHop = map[string]struct{}{
 	"Upgrade":             {},
 }
 
-// Server forwards plain HTTP proxy requests and emits a Flow per exchange. It is
-// an http.Handler so spec 005 can wrap it to add CONNECT on the same listener.
-// One Transport is shared across requests for connection pooling.
+// Server forwards proxied requests and emits a Flow per exchange. It handles
+// both plain http:// forwarding and, when given an Authority, CONNECT with TLS
+// termination. One Transport is shared across requests for connection pooling;
+// it also performs the upstream TLS handshake for intercepted https requests.
 type Server struct {
 	sink      flow.Sink
 	transport *http.Transport
 	bodyCap   int64
+
+	// authority mints leaves for TLS termination. When nil, the server cannot
+	// intercept, so every CONNECT is blind-tunnelled.
+	authority *ca.Authority
+
+	// excluded holds user-configured host suffixes that are always tunnelled.
+	excluded []string
+
+	// learned holds hosts observed to reject our leaf (pinned apps). After the
+	// first failed interception a host lands here and is tunnelled thereafter.
+	mu      sync.RWMutex
+	learned map[string]struct{}
 }
 
 // Option configures a Server.
@@ -47,11 +64,28 @@ func WithBodyCap(n int64) Option {
 	return func(s *Server) { s.bodyCap = n }
 }
 
-// New returns a Server emitting completed flows to sink.
-func New(sink flow.Sink, opts ...Option) *Server {
+// WithExcludedHosts marks host suffixes that must never be intercepted and are
+// blind-tunnelled from the first connection. Match is by suffix on the hostname
+// (port stripped), so "example.com" also excludes "api.example.com".
+func WithExcludedHosts(suffixes ...string) Option {
+	return func(s *Server) { s.excluded = append(s.excluded, suffixes...) }
+}
+
+// WithUpstreamTLS overrides the TLS config used when dialing origins for
+// intercepted https requests. The default verifies against the system roots;
+// this is the seam tests use to trust an httptest origin.
+func WithUpstreamTLS(cfg *tls.Config) Option {
+	return func(s *Server) { s.transport.TLSClientConfig = cfg }
+}
+
+// New returns a Server emitting completed flows to sink. authority may be nil,
+// in which case CONNECT requests are always tunnelled rather than intercepted.
+func New(sink flow.Sink, authority *ca.Authority, opts ...Option) *Server {
 	s := &Server{
-		sink:    sink,
-		bodyCap: flow.DefaultBodyCap,
+		sink:      sink,
+		bodyCap:   flow.DefaultBodyCap,
+		authority: authority,
+		learned:   make(map[string]struct{}),
 		transport: &http.Transport{
 			DialContext: (&net.Dialer{
 				Timeout:   30 * time.Second,
@@ -72,12 +106,12 @@ func New(sink flow.Sink, opts ...Option) *Server {
 	return s
 }
 
-// ServeHTTP dispatches by request shape. CONNECT is spec 005's job and is
-// rejected here rather than silently accepted; a non-absolute URL is not a proxy
-// request at all.
+// ServeHTTP dispatches by request shape: CONNECT starts a tunnel or an
+// interception (spec 005); an absolute-form request is forwarded as cleartext
+// (spec 004); anything else is not a proxy request.
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodConnect {
-		http.Error(w, "CONNECT not supported by the HTTP forwarder (spec 005)", http.StatusMethodNotAllowed)
+		s.handleConnect(w, r)
 		return
 	}
 	if !r.URL.IsAbs() || r.URL.Host == "" {
@@ -85,10 +119,13 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy requires an absolute-form request target", http.StatusBadRequest)
 		return
 	}
-	s.forward(w, r)
+	s.forward(w, r, "http")
 }
 
-func (s *Server) forward(w http.ResponseWriter, r *http.Request) {
+// forward relays one request upstream and captures it. scheme is the flow's
+// scheme; r.URL must already be absolute (the plain path receives it that way,
+// the TLS path reconstructs it from the CONNECT host before calling in).
+func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme string) {
 	started := time.Now()
 
 	// End-to-end request headers: the same stripped set is both stored and
@@ -102,7 +139,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request) {
 	f := &flow.Flow{
 		ID:             flow.NextID(),
 		Started:        started,
-		Scheme:         "http",
+		Scheme:         scheme,
 		Method:         r.Method,
 		Host:           r.URL.Host,
 		Path:           requestPath(r),

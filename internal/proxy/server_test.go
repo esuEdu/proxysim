@@ -78,7 +78,7 @@ func TestForwardAndFlow(t *testing.T) {
 	defer origin.Close()
 
 	sink := &capSink{}
-	front := httptest.NewServer(New(sink))
+	front := httptest.NewServer(New(sink, nil))
 	defer front.Close()
 
 	client := proxiedClient(t, front)
@@ -124,7 +124,7 @@ func TestHopByHopStripping(t *testing.T) {
 	}))
 	defer origin.Close()
 
-	front := httptest.NewServer(New(&capSink{}))
+	front := httptest.NewServer(New(&capSink{}, nil))
 	defer front.Close()
 
 	raw := fmt.Sprintf("GET %s/ HTTP/1.1\r\nHost: %s\r\nProxy-Connection: keep-alive\r\nConnection: X-Custom\r\nX-Custom: secret\r\nX-Kept: yes\r\n\r\n",
@@ -162,7 +162,7 @@ func TestBodyCaptureCappedButForwardedWhole(t *testing.T) {
 	defer origin.Close()
 
 	sink := &capSink{}
-	front := httptest.NewServer(New(sink, WithBodyCap(cap)))
+	front := httptest.NewServer(New(sink, nil, WithBodyCap(cap)))
 	defer front.Close()
 
 	reqBody := bytes.Repeat([]byte("Q"), cap+15)
@@ -205,7 +205,7 @@ func TestCompressionFidelity(t *testing.T) {
 	defer origin.Close()
 
 	sink := &capSink{}
-	front := httptest.NewServer(New(sink))
+	front := httptest.NewServer(New(sink, nil))
 	defer front.Close()
 
 	client := proxiedClient(t, front)
@@ -228,7 +228,7 @@ func TestCompressionFidelity(t *testing.T) {
 // Criterion 6: an unreachable upstream yields 502 and an errored flow.
 func TestUpstreamFailure(t *testing.T) {
 	sink := &capSink{}
-	front := httptest.NewServer(New(sink))
+	front := httptest.NewServer(New(sink, nil))
 	defer front.Close()
 
 	client := proxiedClient(t, front)
@@ -251,7 +251,7 @@ func TestUpstreamFailure(t *testing.T) {
 // Criterion 7: an origin-form (non-proxy) request is rejected, not forwarded.
 func TestNonProxyRequestRejected(t *testing.T) {
 	sink := &capSink{}
-	front := httptest.NewServer(New(sink))
+	front := httptest.NewServer(New(sink, nil))
 	defer front.Close()
 
 	// Hitting the front directly, without proxy configuration, sends origin-form.
@@ -269,20 +269,6 @@ func TestNonProxyRequestRejected(t *testing.T) {
 	}
 }
 
-// CONNECT is rejected until spec 005.
-func TestConnectRejected(t *testing.T) {
-	front := httptest.NewServer(New(&capSink{}))
-	defer front.Close()
-
-	raw := "CONNECT example.com:443 HTTP/1.1\r\nHost: example.com:443\r\n\r\n"
-	resp := rawProxyRequest(t, front, raw)
-	defer resp.Body.Close()
-	io.Copy(io.Discard, resp.Body)
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Errorf("CONNECT status = %d, want 405", resp.StatusCode)
-	}
-}
-
 // Criterion 8: concurrent requests are race-clean and each yields a flow.
 func TestConcurrentRequests(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -291,7 +277,7 @@ func TestConcurrentRequests(t *testing.T) {
 	defer origin.Close()
 
 	sink := &capSink{}
-	front := httptest.NewServer(New(sink))
+	front := httptest.NewServer(New(sink, nil))
 	defer front.Close()
 	client := proxiedClient(t, front)
 
