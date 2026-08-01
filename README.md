@@ -127,6 +127,7 @@ and pass.
 | 006 | Body decoding (gzip/deflate/br, chunked) | done |
 | 007 | `simctl` trust automation | done |
 | 008 | Desktop UI | done |
+| 009 | Origin filtering (simulator / per-app) | spec written |
 
 Each spec carries a human-run manual criterion (real simulator, real browser)
 that the automated tests do not cover; those are yours to exercise via the steps
