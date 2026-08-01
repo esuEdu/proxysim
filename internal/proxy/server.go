@@ -16,6 +16,7 @@ import (
 
 	"proxysim/internal/ca"
 	"proxysim/internal/flow"
+	"proxysim/internal/origin"
 )
 
 // hopByHop lists the connection-scoped headers that a proxy must not forward in
@@ -49,6 +50,13 @@ type Server struct {
 	// excluded holds user-configured host suffixes that are always tunnelled.
 	excluded []string
 
+	// resolveOrigin and originFilter, when set, restrict interception to
+	// connections from matching processes (the simulator, or a named app);
+	// non-matching connections are tunnelled silently. resolveOrigin is nil when
+	// the feature is off, which is the default (spec 009).
+	resolveOrigin origin.Resolver
+	originFilter  origin.Filter
+
 	// learned holds hosts observed to reject our leaf (pinned apps). After the
 	// first failed interception a host lands here and is tunnelled thereafter.
 	mu      sync.RWMutex
@@ -69,6 +77,20 @@ func WithBodyCap(n int64) Option {
 // (port stripped), so "example.com" also excludes "api.example.com".
 func WithExcludedHosts(suffixes ...string) Option {
 	return func(s *Server) { s.excluded = append(s.excluded, suffixes...) }
+}
+
+// WithOriginFilter restricts interception to connections whose originating
+// process the resolver attributes and the filter accepts (e.g. only the
+// simulator, or one app). Non-matching connections are blind-tunnelled and never
+// surfaced as flows. Passing an inactive filter, or a nil resolver, leaves
+// interception unrestricted — the feature is off by default (spec 009).
+func WithOriginFilter(r origin.Resolver, f origin.Filter) Option {
+	return func(s *Server) {
+		if r != nil && f.Active() {
+			s.resolveOrigin = r
+			s.originFilter = f
+		}
+	}
 }
 
 // WithUpstreamTLS overrides the TLS config used when dialing origins for
@@ -119,13 +141,37 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "proxy requires an absolute-form request target", http.StatusBadRequest)
 		return
 	}
-	s.forward(w, r, "http")
+	// A cleartext request from a filtered-out process is forwarded so it still
+	// works, but not captured — host traffic flows, unshown (spec 009).
+	s.forward(w, r, "http", s.originAllows(r))
 }
 
-// forward relays one request upstream and captures it. scheme is the flow's
-// scheme; r.URL must already be absolute (the plain path receives it that way,
-// the TLS path reconstructs it from the CONNECT host before calling in).
-func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme string) {
+// originAllows reports whether a connection may be intercepted under the origin
+// filter. With the filter off it is always true. An origin that cannot be
+// resolved fails toward "not ours": we decline to intercept traffic we cannot
+// attribute, and never fail it.
+func (s *Server) originAllows(r *http.Request) bool {
+	if s.resolveOrigin == nil {
+		return true
+	}
+	local, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
+	remote, err := net.ResolveTCPAddr("tcp", r.RemoteAddr)
+	if err != nil {
+		return false
+	}
+	p, err := s.resolveOrigin(local, remote)
+	if err != nil {
+		return false
+	}
+	return s.originFilter.Match(p)
+}
+
+// forward relays one request upstream. scheme is the flow's scheme; r.URL must
+// already be absolute (the plain path receives it that way, the TLS path
+// reconstructs it from the CONNECT host before calling in). When capture is
+// false the request is still relayed but no flow is emitted — the origin filter
+// uses this to pass a filtered-out process's cleartext traffic through unshown.
+func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme string, capture bool) {
 	started := time.Now()
 
 	// End-to-end request headers: the same stripped set is both stored and
@@ -158,7 +204,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme string) 
 
 	outReq, err := http.NewRequestWithContext(r.Context(), r.Method, r.URL.String(), body)
 	if err != nil {
-		s.fail(w, f, started, "building upstream request: "+err.Error())
+		s.fail(w, f, started, "building upstream request: "+err.Error(), capture)
 		return
 	}
 	outReq.Header = reqHeaders
@@ -169,7 +215,7 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme string) 
 		if reqCapture != nil {
 			f.RequestBody, f.RequestTruncated = reqCapture.result()
 		}
-		s.fail(w, f, started, err.Error())
+		s.fail(w, f, started, err.Error(), capture)
 		return
 	}
 	defer resp.Body.Close()
@@ -197,15 +243,20 @@ func (s *Server) forward(w http.ResponseWriter, r *http.Request, scheme string) 
 	}
 	f.ResponseBody, f.ResponseTruncated = respCapture.result()
 	f.Duration = time.Since(started)
-	s.sink.Emit(f)
+	if capture {
+		s.sink.Emit(f)
+	}
 }
 
-// fail responds 502 and emits an errored flow with response fields zero.
-func (s *Server) fail(w http.ResponseWriter, f *flow.Flow, started time.Time, msg string) {
+// fail responds 502 and, when capturing, emits an errored flow with response
+// fields zero. A filtered-out request still gets its 502 but no flow.
+func (s *Server) fail(w http.ResponseWriter, f *flow.Flow, started time.Time, msg string, capture bool) {
 	f.Error = msg
 	f.Duration = time.Since(started)
 	http.Error(w, "proxysim: upstream request failed", http.StatusBadGateway)
-	s.sink.Emit(f)
+	if capture {
+		s.sink.Emit(f)
+	}
 }
 
 // requestPath returns the path plus query, matching the Flow.Path contract.

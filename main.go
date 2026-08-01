@@ -23,6 +23,7 @@ import (
 
 	"proxysim/internal/ca"
 	"proxysim/internal/flow"
+	"proxysim/internal/origin"
 	"proxysim/internal/proxy"
 	"proxysim/internal/sim"
 	"proxysim/internal/ui"
@@ -39,6 +40,8 @@ func main() {
 	ui := flag.Bool("ui", false, "serve the live traffic web UI (loopback only, separate port)")
 	uiPort := flag.Int("ui-port", 8889, "port for the web UI (always bound to 127.0.0.1)")
 	uiHistory := flag.Int("ui-history", 1000, "number of recent flows the UI keeps for a freshly opened tab")
+	onlySim := flag.Bool("only-sim", false, "intercept only connections originating from the iOS Simulator; tunnel the rest (macOS only)")
+	app := flag.String("app", "", "comma-separated app bundle ids to intercept exclusively (implies -only-sim; macOS only)")
 	flag.Parse()
 
 	// -trust is a one-shot action: install and exit, never bind a listener.
@@ -57,6 +60,8 @@ func main() {
 		ui:        *ui,
 		uiPort:    *uiPort,
 		uiHistory: *uiHistory,
+		onlySim:   *onlySim,
+		apps:      splitSuffixes(*app),
 	}
 	if err := run(cfg); err != nil {
 		log.Fatalf("proxysim: %v", err)
@@ -73,6 +78,8 @@ type config struct {
 	ui        bool
 	uiPort    int
 	uiHistory int
+	onlySim   bool
+	apps      []string
 }
 
 // trustCA installs the machine-local CA into a booted simulator's trust store.
@@ -142,6 +149,11 @@ func run(cfg config) error {
 	if suffixes := splitSuffixes(cfg.exclude); len(suffixes) > 0 {
 		opts = append(opts, proxy.WithExcludedHosts(suffixes...))
 	}
+	// Origin filter: intercept only the simulator (or a named app) and tunnel
+	// everything else untouched. Off unless the user asks (spec 009).
+	if filter := origin.BuildFilter(cfg.onlySim, cfg.apps); filter.Active() {
+		opts = append(opts, proxy.WithOriginFilter(origin.Resolve, filter))
+	}
 	handler := proxy.New(sink, authority, opts...)
 
 	srv := &http.Server{Handler: handler}
@@ -149,6 +161,11 @@ func run(cfg config) error {
 	printBanner(addr, dir, authority)
 	if uiLn != nil {
 		fmt.Fprintf(os.Stderr, "UI:          http://%s\n\n", uiLn.Addr())
+	}
+	if len(cfg.apps) > 0 {
+		fmt.Fprintf(os.Stderr, "Intercepting only apps: %s (all other traffic tunnelled)\n\n", strings.Join(cfg.apps, ", "))
+	} else if cfg.onlySim {
+		fmt.Fprint(os.Stderr, "Intercepting only iOS Simulator traffic (host traffic tunnelled)\n\n")
 	}
 
 	// Serve until a signal arrives, then shut down gracefully.

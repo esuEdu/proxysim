@@ -22,8 +22,17 @@ const connectEstablished = "HTTP/1.1 200 Connection Established\r\n\r\n"
 // tunnelled from the start; everything else is intercepted.
 func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	hostPort := r.Host // "host:port", per the CONNECT target
+
+	// Origin filter (spec 009) is the outer gate: a connection from a process we
+	// were not asked to watch is tunnelled silently — passed through untouched and
+	// never surfaced as a flow, unlike an excluded host which is shown as
+	// tunnelled. Decided here, before the host matters.
+	if !s.originAllows(r) {
+		s.tunnel(w, hostPort, "", false)
+		return
+	}
 	if s.shouldTunnel(hostPort) {
-		s.tunnel(w, hostPort, "")
+		s.tunnel(w, hostPort, "", true)
 		return
 	}
 	s.intercept(w, hostPort)
@@ -102,7 +111,9 @@ func (s *Server) serveDecrypted(conn net.Conn, connectHost string) {
 		// Reconstruct the absolute URL the forwarding core expects.
 		r.URL.Scheme = "https"
 		r.URL.Host = host
-		s.forward(w, r, "https")
+		// The origin filter already passed at CONNECT for this connection, so
+		// every decrypted request on it is captured.
+		s.forward(w, r, "https", true)
 	})
 
 	l := newSingleConnListener(conn)
@@ -119,9 +130,11 @@ func (s *Server) serveDecrypted(conn net.Conn, connectHost string) {
 }
 
 // tunnel blind-copies bytes between the client and origin without inspecting
-// them, emitting a single un-intercepted flow when the connection ends. note is
-// non-empty only when the tunnel is a fallback from a failed interception.
-func (s *Server) tunnel(w http.ResponseWriter, hostPort, note string) {
+// them. When emit is true it records a single un-intercepted flow when the
+// connection ends; the origin filter passes emit=false so a filtered-out
+// connection stays invisible. note is non-empty only when the tunnel is a
+// fallback from a failed interception.
+func (s *Server) tunnel(w http.ResponseWriter, hostPort, note string, emit bool) {
 	started := time.Now()
 	client, err := hijack(w)
 	if err != nil {
@@ -134,7 +147,9 @@ func (s *Server) tunnel(w http.ResponseWriter, hostPort, note string) {
 	if err != nil {
 		// The client is waiting on our CONNECT reply; a 502 is the honest answer.
 		io.WriteString(client, "HTTP/1.1 502 Bad Gateway\r\n\r\n")
-		s.emitTunnel(hostPort, started, err.Error())
+		if emit {
+			s.emitTunnel(hostPort, started, err.Error())
+		}
 		return
 	}
 	defer upstream.Close()
@@ -150,7 +165,9 @@ func (s *Server) tunnel(w http.ResponseWriter, hostPort, note string) {
 	go func() { io.Copy(client, upstream); done <- struct{}{} }()
 	<-done
 
-	s.emitTunnel(hostPort, started, note)
+	if emit {
+		s.emitTunnel(hostPort, started, note)
+	}
 }
 
 // emitTunnel emits the flow for a tunnelled (un-inspected) connection.

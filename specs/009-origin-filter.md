@@ -1,7 +1,8 @@
 # 009 — Origin Filtering (simulator / per-app)
 
-**Status:** ready to implement (see the shared-daemon open question — the one
-assumption to confirm early)
+**Status:** implemented. Automated criteria 1–9 pass; the manual criterion 10
+(real per-app filtering against a booted simulator) and the shared-daemon open
+question remain for human confirmation.
 **Package:** `internal/origin` (new), wired through `internal/proxy`
 **Depends on:** 004 (plain HTTP forwarding), 005 (CONNECT + TLS termination, the
 blind-tunnel fallback this reuses)

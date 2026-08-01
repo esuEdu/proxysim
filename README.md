@@ -41,6 +41,8 @@ and click one for its headers and decoded bodies.
 | `-ui` | `false` | serve the live web UI (loopback only, separate port) |
 | `-ui-port` | `8889` | UI listen port (always bound to `127.0.0.1`) |
 | `-ui-history` | `1000` | recent flows the UI keeps for a freshly opened tab |
+| `-only-sim` | `false` | intercept only iOS Simulator traffic; tunnel everything else (macOS) |
+| `-app` | — | comma-separated app bundle ids to intercept exclusively (implies `-only-sim`) |
 | `-trust` | `false` | install the CA into the booted simulator's trust store, then exit |
 | `-trust-set` | — | simulator set to target (e.g. `previews` for Xcode Previews) |
 | `-device` | — | UDID of the booted simulator, when several are booted |
@@ -76,6 +78,21 @@ at us.
 networksetup -setsecurewebproxy Wi-Fi 127.0.0.1 8888
 networksetup -setwebproxy       Wi-Fi 127.0.0.1 8888
 ```
+
+Because the system proxy is global, host traffic (Safari, daemons) routes through
+proxysim too. Narrow capture to just the simulator, or one app, by originating
+process:
+
+```bash
+./proxysim -ui -only-sim                     # only Simulator traffic; host tunnelled + hidden
+./proxysim -ui -app com.you.MyApp            # only that app; everything else tunnelled + hidden
+```
+
+Non-matching connections are blind-tunnelled (they still work), just neither
+decrypted nor shown. Per-app relies on the app opening its own sockets, which
+holds for foreground `URLSession` traffic; background sessions that egress via a
+shared daemon may resolve to the daemon rather than the app — `-only-sim` still
+catches those. macOS only.
 
 Run your app in the Simulator and watch traffic in the UI. **Revert the system
 proxy when done**, or all Mac traffic keeps routing through proxysim:
@@ -127,7 +144,7 @@ and pass.
 | 006 | Body decoding (gzip/deflate/br, chunked) | done |
 | 007 | `simctl` trust automation | done |
 | 008 | Desktop UI | done |
-| 009 | Origin filtering (simulator / per-app) | spec written |
+| 009 | Origin filtering (simulator / per-app) | done |
 
 Each spec carries a human-run manual criterion (real simulator, real browser)
 that the automated tests do not cover; those are yours to exercise via the steps
