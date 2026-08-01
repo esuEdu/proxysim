@@ -11,6 +11,9 @@
 # Test binary, built with `go test -c`
 *.test
 
+# The built binary (README's `go build -o proxysim .`)
+/proxysim
+
 # Code coverage profiles and other test artifacts
 *.out
 coverage.*
