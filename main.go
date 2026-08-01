@@ -24,6 +24,7 @@ import (
 	"proxysim/internal/ca"
 	"proxysim/internal/flow"
 	"proxysim/internal/proxy"
+	"proxysim/internal/sim"
 )
 
 func main() {
@@ -31,11 +32,48 @@ func main() {
 	caDir := flag.String("ca-dir", "~/.proxysim", "directory holding ca.crt and ca.key")
 	verbose := flag.Bool("verbose", false, "print request/response headers and bodies, not just a summary line")
 	exclude := flag.String("exclude", "", "comma-separated host suffixes to never intercept (blind-tunnel instead)")
+	trust := flag.Bool("trust", false, "install the CA into the booted simulator's trust store, then exit (does not serve)")
+	trustSet := flag.String("trust-set", "", "simulator set to target (e.g. \"previews\" for Xcode Previews); default set when empty")
+	device := flag.String("device", "", "UDID of the booted simulator to target when several are booted")
 	flag.Parse()
+
+	// -trust is a one-shot action: install and exit, never bind a listener.
+	if *trust {
+		if err := trustCA(*caDir, *trustSet, *device); err != nil {
+			log.Fatalf("proxysim: %v", err)
+		}
+		return
+	}
 
 	if err := run(*port, *caDir, *verbose, *exclude); err != nil {
 		log.Fatalf("proxysim: %v", err)
 	}
+}
+
+// trustCA installs the machine-local CA into a booted simulator's trust store.
+// It is deliberately separate from CA lifecycle: it never generates a CA, only
+// installs the one the user already has under -ca-dir.
+func trustCA(caDir, set, device string) error {
+	dir, err := expandPath(caDir)
+	if err != nil {
+		return err
+	}
+	certPath := filepath.Join(dir, "ca.crt")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	if err := sim.InstallRootCert(ctx, sim.ExecRunner, certPath, set, device); err != nil {
+		return err
+	}
+
+	if set != "" {
+		fmt.Fprintf(os.Stderr, "proxysim: trusted %s in simulator set %q\n", certPath, set)
+	} else {
+		fmt.Fprintf(os.Stderr, "proxysim: trusted %s in the booted simulator\n", certPath)
+	}
+	fmt.Fprintln(os.Stderr, "Trust is lost on `simctl erase`; re-run `proxysim -trust` after resetting a device.")
+	return nil
 }
 
 func run(port int, caDir string, verbose bool, exclude string) error {
