@@ -90,30 +90,48 @@ func classify(pid int, path string) Process {
 	return p
 }
 
-// simMarker is the path segment that identifies a booted simulator's device
-// container. (Xcode Previews uses a separate "Simulator Devices" tree — a
-// follow-up; see spec 009 / 007's previews note.)
-const simMarker = "/CoreSimulator/Devices/"
+// A simulator process wears one of two path shapes (confirmed by the 009 probe):
+//
+//   - an installed app lives under the per-device container, so its path carries
+//     the device UDID and a resolvable .app bundle;
+//   - a runtime/system process (MobileSafari, com.apple.WebKit.Networking, trustd,
+//     …) lives under the shared runtime root, with no per-device UDID and often no
+//     user-facing .app.
+//
+// Recognising only the first would silently miss all of Safari and the system
+// daemons under -only-sim, so we match both.
+const (
+	deviceMarker  = "/CoreSimulator/Devices/"
+	runtimeMarker = ".simruntime/"
+)
 
-// simParts detects whether path lives inside a simulator device container and,
-// if so, returns the device UDID and the enclosing .app directory (empty when the
-// binary is not inside a bundle).
+// simParts reports whether path belongs to the simulator and, if so, returns the
+// device UDID (empty for shared runtime processes) and the enclosing .app
+// directory (empty when the binary is not inside a bundle).
 func simParts(path string) (udid, appDir string, ok bool) {
-	i := strings.Index(path, simMarker)
-	if i < 0 {
-		return "", "", false
+	if i := strings.Index(path, deviceMarker); i >= 0 {
+		rest := path[i+len(deviceMarker):]
+		if slash := strings.IndexByte(rest, '/'); slash >= 0 {
+			return rest[:slash], appDirOf(path), true
+		}
 	}
-	rest := path[i+len(simMarker):]
-	slash := strings.IndexByte(rest, '/')
-	if slash < 0 {
-		return "", "", false
+	// Runtime/system process: simulator traffic, but shared across devices — no
+	// UDID, and networking/extension processes have no user-facing .app bundle.
+	if strings.Contains(path, runtimeMarker) {
+		return "", appDirOf(path), true
 	}
-	udid = rest[:slash]
+	return "", "", false
+}
 
+// appDirOf returns the enclosing .app directory of an executable path, or "" if
+// the binary is not inside a bundle. It matches ".app/" exactly, so an ".appex/"
+// extension container (e.g. WebKit's NetworkingExtension) is correctly not
+// treated as a bundle.
+func appDirOf(path string) string {
 	if k := strings.Index(path, ".app/"); k >= 0 {
-		appDir = path[:k+len(".app")]
+		return path[:k+len(".app")]
 	}
-	return udid, appDir, true
+	return ""
 }
 
 // bundleCache memoises the .app-directory → bundle-id lookup: the mapping is

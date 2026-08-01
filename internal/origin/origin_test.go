@@ -21,10 +21,25 @@ func TestSimParts(t *testing.T) {
 			wantAppDir: "/Users/dev/Library/Developer/CoreSimulator/Devices/E1B2-DEAD-BEEF/data/Containers/Bundle/Application/AAAA-BBBB/MyApp.app",
 		},
 		{
-			name:     "simulator system daemon, not in a .app",
+			name:     "simulator daemon under the device container",
 			path:     "/Users/dev/Library/Developer/CoreSimulator/Devices/E1B2-DEAD-BEEF/data/usr/libexec/somebd",
 			wantOK:   true,
 			wantUDID: "E1B2-DEAD-BEEF",
+		},
+		{
+			// Runtime app under the shared runtime root: simulator, no device UDID,
+			// but a resolvable .app (paths from the real 009 probe).
+			name:       "runtime-root app (MobileSafari)",
+			path:       "/Library/Developer/CoreSimulator/Volumes/iOS_23F77/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.5.simruntime/Contents/Resources/RuntimeRoot/Applications/MobileSafari.app/MobileSafari",
+			wantOK:     true,
+			wantAppDir: "/Library/Developer/CoreSimulator/Volumes/iOS_23F77/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.5.simruntime/Contents/Resources/RuntimeRoot/Applications/MobileSafari.app",
+		},
+		{
+			// WebKit's networking process: simulator, but an .appex extension — no
+			// user-facing .app bundle, so -app cannot attribute WKWebView traffic.
+			name:   "runtime-root WebKit networking (.appex, no bundle)",
+			path:   "/Library/Developer/CoreSimulator/Volumes/iOS_23F77/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.5.simruntime/Contents/Resources/RuntimeRoot/System/Library/ExtensionKit/Extensions/NetworkingExtension.appex/com.apple.WebKit.Networking",
+			wantOK: true,
 		},
 		{name: "host process", path: "/Applications/Safari.app/Contents/MacOS/Safari", wantOK: false},
 		{name: "plain binary", path: "/usr/bin/curl", wantOK: false},
@@ -50,8 +65,16 @@ func TestClassifyMarksSimulator(t *testing.T) {
 	// classification of Simulator/UDID must not depend on reading Info.plist.
 	p := classify(1234, simExecPath)
 	if !p.Simulator || p.DeviceUDID != "E1B2-DEAD-BEEF" || p.PID != 1234 {
-		t.Errorf("classify simulator = %+v", p)
+		t.Errorf("classify installed app = %+v", p)
 	}
+
+	// A runtime/system process (WebKit networking) must still classify as
+	// simulator, so -only-sim catches it — with no device UDID and no bundle.
+	webkit := classify(50, "/Library/Developer/CoreSimulator/Volumes/iOS_23F77/Library/Developer/CoreSimulator/Profiles/Runtimes/iOS 26.5.simruntime/Contents/Resources/RuntimeRoot/System/Library/ExtensionKit/Extensions/NetworkingExtension.appex/com.apple.WebKit.Networking")
+	if !webkit.Simulator || webkit.DeviceUDID != "" || webkit.BundleID != "" {
+		t.Errorf("classify runtime process = %+v, want simulator with no UDID/bundle", webkit)
+	}
+
 	host := classify(5, "/usr/bin/curl")
 	if host.Simulator || host.DeviceUDID != "" {
 		t.Errorf("classify host = %+v, want non-simulator", host)

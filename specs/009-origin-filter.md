@@ -1,8 +1,11 @@
 # 009 — Origin Filtering (simulator / per-app)
 
-**Status:** implemented. Automated criteria 1–9 pass; the manual criterion 10
-(real per-app filtering against a booted simulator) and the shared-daemon open
-question remain for human confirmation.
+**Status:** implemented. Automated criteria 1–9 pass. The 009 probe was run
+against a real booted simulator: a real app's native traffic is intercepted by
+`-only-sim` and attributable for `-app` (the shared-daemon worry did not
+materialise), and the probe revealed that simulator processes take two path
+shapes — installed apps under the device container and runtime/system processes
+under the runtime root — so classification recognises both.
 **Package:** `internal/origin` (new), wired through `internal/proxy`
 **Depends on:** 004 (plain HTTP forwarding), 005 (CONNECT + TLS termination, the
 blind-tunnel fallback this reuses)
@@ -74,6 +77,24 @@ The lessons that shaped the design, some learned in the 009 spike:
   (`…/CoreSimulator/Devices/<UDID>/…/YourApp.app/YourApp`) carries the app *name*
   and the device UDID but not the bundle id; that lives in the `.app`'s
   `Info.plist` (`CFBundleIdentifier`). Read it once per `.app` path and cache it.
+- **A simulator process wears one of two paths (confirmed by the probe).**
+  *Installed* apps — the user's own — live under the device container
+  `…/CoreSimulator/Devices/<UDID>/…/YourApp.app/YourApp`: per-device, with a
+  resolvable bundle id. But the simulator's *runtime and system* processes —
+  MobileSafari, `com.apple.WebKit.Networking`, `trustd`, `webprivacyd`, and the
+  like — live under the shared runtime root
+  `…/<ver>.simruntime/Contents/Resources/RuntimeRoot/…`: no per-device UDID, and
+  (for the networking/extension processes) no user-facing `.app` bundle.
+  `-only-sim` must recognise **both** or it silently misses all of Safari and the
+  system daemons — which is exactly what the first cut did. The device marker
+  alone is not enough.
+- **WebView traffic belongs to a networking process, not the app.** A `WKWebView`
+  request egresses through `com.apple.WebKit.Networking` (a runtime-root process),
+  not the hosting app, so it resolves as "simulator, no bundle." `-only-sim`
+  catches it; `-app` cannot attribute it to your bundle. Only the app's own
+  `URLSession`/`CFNetwork` traffic carries the app's identity. The probe confirmed
+  a real app's native calls resolve to the app process — so per-app works for
+  them — while its web views would not.
 
 ## Security note
 
@@ -205,16 +226,17 @@ simulator except the last.
 
 ## Open questions
 
-- **Shared-daemon traffic — the assumption to confirm first.** This spec assumes
-  a Simulator app opens its own sockets, so its connection resolves to the app
-  process (per-app `-app` works). If some traffic — notably `URLSession`
-  **background** sessions — egresses through a shared service
-  (`nsurlsessiond`/CoreSimulator daemon) instead, it resolves to that service,
-  not the app: `-app` will miss it, and `-only-sim` catches it only if the
-  service is itself a Simulator process. Confirm with the 009 probe against a real
-  app **before building `-app`**; if per-app proves unreliable, ship `-only-sim`
-  first (always correct: sim-vs-host) and treat `-app` as a follow-up. `-only-sim`
-  is the safe floor this spec can always deliver.
+- **Shared-daemon traffic — resolved by the probe.** The worry was that a
+  Simulator app's traffic might egress through a shared service rather than the
+  app process, defeating `-app`. Running the probe against a real app settled it:
+  a native app's `URLSession`/`CFNetwork` connections resolve to the **app
+  process itself** (path under `…/Devices/<UDID>/…/App.app/App`, parent
+  `launchd_sim`), so `-app` works. The one carve-out is **WebView traffic**, which
+  runs in `com.apple.WebKit.Networking` (a runtime-root process with no app
+  bundle): `-only-sim` catches it, `-app` cannot attribute it. `URLSession`
+  background sessions were not observed to funnel through a host daemon; if a
+  future case does, it will surface as "simulator, no bundle" and fall to
+  `-only-sim`, never mis-attributed.
 - **Bundle id vs app name.** Matching by bundle id (Info.plist) is precise but
   costs a plist read (cached per `.app`). Matching by the app name already in the
   path is cheaper but coarser. Start with bundle id; fall back to app-name match
