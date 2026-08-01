@@ -26,6 +26,7 @@ import (
 	"proxysim/internal/origin"
 	"proxysim/internal/proxy"
 	"proxysim/internal/sim"
+	"proxysim/internal/sysproxy"
 	"proxysim/internal/ui"
 )
 
@@ -42,6 +43,8 @@ func main() {
 	uiHistory := flag.Int("ui-history", 1000, "number of recent flows the UI keeps for a freshly opened tab")
 	onlySim := flag.Bool("only-sim", false, "intercept only connections originating from the iOS Simulator; tunnel the rest (macOS only)")
 	app := flag.String("app", "", "comma-separated app bundle ids to intercept exclusively (implies -only-sim; macOS only)")
+	systemProxy := flag.Bool("system-proxy", false, "point the macOS system proxy at proxysim on startup and restore it on exit (implies -only-sim; macOS only)")
+	noTrust := flag.Bool("no-trust", false, "do not auto-trust the CA in the booted simulator on startup")
 	flag.Parse()
 
 	// -trust is a one-shot action: install and exit, never bind a listener.
@@ -53,15 +56,19 @@ func main() {
 	}
 
 	cfg := config{
-		port:      *port,
-		caDir:     *caDir,
-		verbose:   *verbose,
-		exclude:   *exclude,
-		ui:        *ui,
-		uiPort:    *uiPort,
-		uiHistory: *uiHistory,
-		onlySim:   *onlySim,
-		apps:      splitSuffixes(*app),
+		port:        *port,
+		caDir:       *caDir,
+		verbose:     *verbose,
+		exclude:     *exclude,
+		trustSet:    *trustSet,
+		device:      *device,
+		ui:          *ui,
+		uiPort:      *uiPort,
+		uiHistory:   *uiHistory,
+		onlySim:     *onlySim,
+		apps:        splitSuffixes(*app),
+		systemProxy: *systemProxy,
+		noTrust:     *noTrust,
 	}
 	if err := run(cfg); err != nil {
 		log.Fatalf("proxysim: %v", err)
@@ -71,15 +78,19 @@ func main() {
 // config is the resolved serving configuration, threaded into run so the
 // signature stays readable as options accrue.
 type config struct {
-	port      int
-	caDir     string
-	verbose   bool
-	exclude   string
-	ui        bool
-	uiPort    int
-	uiHistory int
-	onlySim   bool
-	apps      []string
+	port        int
+	caDir       string
+	verbose     bool
+	exclude     string
+	trustSet    string
+	device      string
+	ui          bool
+	uiPort      int
+	uiHistory   int
+	onlySim     bool
+	apps        []string
+	systemProxy bool
+	noTrust     bool
 }
 
 // trustCA installs the machine-local CA into a booted simulator's trust store.
@@ -108,6 +119,49 @@ func trustCA(caDir, set, device string) error {
 	return nil
 }
 
+// autoTrust installs the CA into the booted simulator on startup so the user does
+// not run `-trust` by hand. It is best-effort: any failure (no booted device, no
+// Xcode toolchain) is reported and swallowed — the proxy is still useful for curl
+// and pre-boot startup, so trust trouble must never stop it serving (spec 010).
+func autoTrust(certPath, set, device string) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := sim.InstallRootCert(ctx, sim.ExecRunner, certPath, set, device); err != nil {
+		fmt.Fprintf(os.Stderr, "proxysim: auto-trust skipped: %v\n", err)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "proxysim: CA trusted in the booted simulator")
+}
+
+// setupSystemProxy recovers any stale takeover a previous run left behind, then
+// points the macOS system proxy at proxysim and returns an idempotent restore.
+// On a non-fatal failure (offline, admin rights required) it prints an actionable
+// hint and returns an error so the caller skips wiring restore but keeps serving.
+func setupSystemProxy(dir string, port int) (func() error, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	mgr := sysproxy.NewManager(sysproxy.ExecRunner, filepath.Join(dir, "sysproxy.json"))
+	if err := mgr.Recover(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "proxysim: could not recover a prior system-proxy snapshot: %v\n", err)
+	}
+
+	restore, err := mgr.Apply(ctx, port)
+	if err != nil {
+		switch {
+		case errors.Is(err, sysproxy.ErrNoPrimaryService):
+			fmt.Fprintln(os.Stderr, "proxysim: no active network service; set the system proxy to 127.0.0.1 manually if needed")
+		case errors.Is(err, sysproxy.ErrNeedAdmin):
+			fmt.Fprintf(os.Stderr, "proxysim: could not set the system proxy automatically (admin rights required); set it manually to 127.0.0.1:%d\n", port)
+		default:
+			fmt.Fprintf(os.Stderr, "proxysim: could not set the system proxy automatically: %v\n", err)
+		}
+		return nil, err
+	}
+	fmt.Fprintf(os.Stderr, "System proxy: %s → 127.0.0.1:%d (restored on exit)\n\n", mgr.Service(), port)
+	return restore, nil
+}
+
 func run(cfg config) error {
 	dir, err := expandPath(cfg.caDir)
 	if err != nil {
@@ -119,6 +173,13 @@ func run(cfg config) error {
 		return err
 	}
 
+	// Remove the manual "trust the CA in the simulator" step: install it on every
+	// startup unless opted out. Idempotent and best-effort — no booted device or no
+	// Xcode toolchain must not stop the proxy serving (spec 010).
+	if !cfg.noTrust {
+		autoTrust(filepath.Join(dir, "ca.crt"), cfg.trustSet, cfg.device)
+	}
+
 	// Bind loopback only. A MITM proxy reachable from the network is a genuine
 	// hazard, so this address is not configurable — not behind a flag, not for
 	// testing (see CLAUDE.md).
@@ -126,6 +187,24 @@ func run(cfg config) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listening on %s: %w", addr, err)
+	}
+
+	// Take over the macOS system proxy so the user does not touch System Settings,
+	// and — the part that matters — put it back on exit. The takeover routes every
+	// host app through us, so it implies -only-sim: host traffic is tunnelled
+	// untouched, never decrypted (spec 010). A failure here (no admin rights,
+	// offline) degrades to a printed hint; we keep serving.
+	onlySim := cfg.onlySim
+	if cfg.systemProxy {
+		onlySim = true
+		restore, err := setupSystemProxy(dir, cfg.port)
+		if err == nil {
+			defer func() {
+				if err := restore(); err != nil {
+					fmt.Fprintf(os.Stderr, "proxysim: restoring system proxy: %v\n", err)
+				}
+			}()
+		}
 	}
 
 	// The console is always a consumer. The UI, when enabled, is simply another
@@ -150,8 +229,9 @@ func run(cfg config) error {
 		opts = append(opts, proxy.WithExcludedHosts(suffixes...))
 	}
 	// Origin filter: intercept only the simulator (or a named app) and tunnel
-	// everything else untouched. Off unless the user asks (spec 009).
-	if filter := origin.BuildFilter(cfg.onlySim, cfg.apps); filter.Active() {
+	// everything else untouched. Off unless the user asks (spec 009), or forced on
+	// by -system-proxy (spec 010).
+	if filter := origin.BuildFilter(onlySim, cfg.apps); filter.Active() {
 		opts = append(opts, proxy.WithOriginFilter(origin.Resolve, filter))
 	}
 	handler := proxy.New(sink, authority, opts...)
@@ -164,7 +244,7 @@ func run(cfg config) error {
 	}
 	if len(cfg.apps) > 0 {
 		fmt.Fprintf(os.Stderr, "Intercepting only apps: %s (all other traffic tunnelled)\n\n", strings.Join(cfg.apps, ", "))
-	} else if cfg.onlySim {
+	} else if onlySim {
 		fmt.Fprint(os.Stderr, "Intercepting only iOS Simulator traffic (host traffic tunnelled)\n\n")
 	}
 
