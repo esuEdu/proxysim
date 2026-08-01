@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 )
 
 // Process is the resolved originator of a connection.
@@ -60,6 +61,40 @@ func BuildFilter(onlySim bool, apps []string) Filter {
 // origin resolution entirely and intercepts as before.
 func (f Filter) Active() bool {
 	return f.OnlySim || len(f.Apps) > 0
+}
+
+// Controller carries the Filter in force for a session and lets it be swapped at
+// runtime — the seam the UI uses to re-scope capture without a restart (spec 011).
+// Reads happen on the request path, once per accepted connection, so they are
+// lock-free via an atomic pointer; a published Filter is treated as immutable, so
+// Set stores a fresh Filter rather than mutating one in place (its Apps map must
+// never be written after publication).
+type Controller struct {
+	p atomic.Pointer[Filter]
+}
+
+// NewController returns a Controller seeded with initial (typically built from the
+// -only-sim/-app flags). The initial filter may be inactive, meaning "intercept
+// everything" until the UI narrows it.
+func NewController(initial Filter) *Controller {
+	c := &Controller{}
+	c.p.Store(&initial)
+	return c
+}
+
+// Current returns the filter in force. Safe to call from the request path.
+func (c *Controller) Current() Filter {
+	if f := c.p.Load(); f != nil {
+		return *f
+	}
+	return Filter{}
+}
+
+// Set publishes f as the filter in force from the next connection onward.
+// In-flight connections keep the verdict they were accepted with. f must not be
+// mutated after this call — build a new Filter to change the selection again.
+func (c *Controller) Set(f Filter) {
+	c.p.Store(&f)
 }
 
 // Match reports whether a connection from p should be intercepted. With an app

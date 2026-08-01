@@ -17,6 +17,11 @@ const el = {
   filter: document.getElementById("filter"),
   detail: document.getElementById("detail"),
   clear: document.getElementById("clear"),
+  control: document.getElementById("control"),
+  sim: document.getElementById("sim-select"),
+  app: document.getElementById("app-select"),
+  scope: document.getElementById("scope"),
+  simRefresh: document.getElementById("sim-refresh"),
 };
 
 // ---- rendering the list -----------------------------------------------------
@@ -194,6 +199,108 @@ function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 }
 
+// ---- origin control (spec 011) ----------------------------------------------
+// The control bar re-scopes what the proxy intercepts, live: pick a simulator to
+// list its apps, then choose Everything / All simulator traffic / one app. Each
+// choice PUTs the new filter; the server applies it from the next connection. The
+// server is the one source of truth — we read /filter to reflect a flag-set or
+// second-tab state, and never assume our own selection stuck.
+
+const APP_ALL = "__all__";   // no filter — intercept everything
+const APP_SIM = "__sim__";   // -only-sim — all simulator traffic
+let activeFilter = { onlySim: false, apps: [] };
+
+async function initControl() {
+  try {
+    const res = await fetch("filter");
+    if (!res.ok) return; // 501 when control is not wired: leave the bar hidden
+    activeFilter = await res.json();
+  } catch { return; }
+
+  el.control.hidden = false;
+  el.sim.addEventListener("change", async () => { await loadApps(); reflectFilter(activeFilter); });
+  el.app.addEventListener("change", applyFilter);
+  el.simRefresh.addEventListener("click", refreshControl);
+  await refreshControl();
+}
+
+async function refreshControl() {
+  await loadSims();
+  reflectFilter(activeFilter);
+}
+
+async function loadSims() {
+  let sims = [];
+  try { sims = await (await fetch("sims")).json(); } catch { /* keep empty */ }
+  el.sim.innerHTML = sims.length
+    ? sims.map((s) => `<option value="${esc(s.udid)}">${esc(s.name)}</option>`).join("")
+    : `<option value="">no booted simulator</option>`;
+  await loadApps();
+}
+
+async function loadApps() {
+  const fixed =
+    `<option value="${APP_ALL}">Everything (no filter)</option>` +
+    `<option value="${APP_SIM}">All simulator traffic</option>`;
+  const udid = el.sim.value;
+  let apps = [];
+  if (udid) {
+    try { apps = await (await fetch(`sims/${encodeURIComponent(udid)}/apps`)).json(); } catch { /* keep empty */ }
+  }
+  el.app.innerHTML = fixed + apps
+    .map((a) => `<option value="${esc(a.bundleID)}">${esc(a.name)} — ${esc(a.bundleID)}</option>`)
+    .join("");
+}
+
+// reflectFilter points the app dropdown at whatever the server says is in force.
+// A filtered app not installed on the selected simulator still shows, so the live
+// selection is never hidden.
+function reflectFilter(f) {
+  if (f.apps && f.apps.length) {
+    const id = f.apps[0];
+    if (![...el.app.options].some((o) => o.value === id)) {
+      const opt = document.createElement("option");
+      opt.value = id;
+      opt.textContent = `${id} (not on this simulator)`;
+      el.app.appendChild(opt);
+    }
+    el.app.value = id;
+  } else {
+    el.app.value = f.onlySim ? APP_SIM : APP_ALL;
+  }
+  updateScope();
+}
+
+function selectionToFilter() {
+  const v = el.app.value;
+  if (v === APP_ALL) return { onlySim: false, apps: [] };
+  if (v === APP_SIM) return { onlySim: true, apps: [] };
+  return { onlySim: true, apps: [v] };
+}
+
+async function applyFilter() {
+  updateScope();
+  try {
+    const res = await fetch("filter", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(selectionToFilter()),
+    });
+    if (res.ok) activeFilter = await res.json();
+  } catch { /* selection stands; a refresh re-syncs from the server */ }
+  updateScope();
+}
+
+function updateScope() {
+  const v = el.app.value;
+  if (v === APP_ALL) el.scope.textContent = "Intercepting everything";
+  else if (v === APP_SIM) el.scope.textContent = "Intercepting iOS Simulator only";
+  else {
+    const opt = el.app.selectedOptions[0];
+    el.scope.textContent = `Intercepting ${opt ? opt.textContent : v}`;
+  }
+}
+
 // ---- wiring -----------------------------------------------------------------
 
 el.rows.addEventListener("click", (e) => {
@@ -231,3 +338,4 @@ function connect() {
 }
 
 loadHistory().then(connect);
+initControl();

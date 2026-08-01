@@ -23,6 +23,7 @@ html, body {
   color: var(--fg);
   font: 13px/1.5 system-ui, -apple-system, sans-serif;
 }
+body { display: flex; flex-direction: column; }
 
 #bar {
   display: flex;
@@ -59,10 +60,44 @@ html, body {
 }
 #clear:hover { background: var(--bg-hover); }
 
+#control {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 7px 12px;
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
+  color: var(--fg-dim);
+}
+#control[hidden] { display: none; }
+.ctl { display: inline-flex; align-items: center; gap: 6px; color: var(--fg-dim); }
+#control select {
+  padding: 4px 8px;
+  background: var(--bg-alt);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  font: inherit;
+  max-width: 260px;
+}
+#control select:focus { outline: none; border-color: var(--accent); }
+.scope { flex: 1; color: var(--accent); font-variant-numeric: tabular-nums; }
+#sim-refresh {
+  padding: 4px 10px;
+  background: var(--bg-alt);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+}
+#sim-refresh:hover { background: var(--bg-hover); }
+
 main {
   display: grid;
   grid-template-columns: 1fr minmax(340px, 42%);
-  height: calc(100% - 49px);
+  flex: 1;
+  min-height: 0;
 }
 @media (max-width: 780px) {
   main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }

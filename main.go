@@ -133,6 +133,17 @@ func autoTrust(certPath, set, device string) {
 	fmt.Fprintln(os.Stderr, "proxysim: CA trusted in the booted simulator")
 }
 
+// bootedDevices and installedApps are the UI's simulator/app enumerators (spec
+// 011), thin adapters over internal/sim's production ExecRunner. They are passed
+// to the Hub so its control endpoints can populate the sim and app pickers.
+func bootedDevices(ctx context.Context) ([]sim.Device, error) {
+	return sim.BootedDevices(ctx, sim.ExecRunner)
+}
+
+func installedApps(ctx context.Context, udid string) ([]sim.App, error) {
+	return sim.InstalledApps(ctx, sim.ExecRunner, udid)
+}
+
 // setupSystemProxy recovers any stale takeover a previous run left behind, then
 // points the macOS system proxy at proxysim and returns an idempotent restore.
 // On a non-fatal failure (offline, admin rights required) it prints an actionable
@@ -211,11 +222,20 @@ func run(cfg config) error {
 	// flow.Sink alongside it — the proxy does not know it exists (spec 008). Its
 	// Emit is non-blocking (drops per client), so it sits directly in the fan-out
 	// with no AsyncSink wrapper needed.
+	// Seed the origin filter from the flags (and -system-proxy's implied only-sim).
+	// With the UI on it becomes runtime-mutable through a Controller the control bar
+	// drives (spec 011); with the UI off the flags are the only control and the
+	// filter is fixed for the process (spec 009).
+	seed := origin.BuildFilter(onlySim, cfg.apps)
+
 	var sink flow.Sink = flow.NewConsoleSink(os.Stdout, cfg.verbose)
 	var uiSrv *http.Server
 	var uiLn net.Listener
+	var controller *origin.Controller
 	if cfg.ui {
 		hub := ui.New(cfg.uiHistory)
+		controller = origin.NewController(seed)
+		hub.SetControl(controller, bootedDevices, installedApps)
 		sink = flow.MultiSink{sink, hub}
 		uiLn, err = ui.Listen(cfg.uiPort)
 		if err != nil {
@@ -229,10 +249,14 @@ func run(cfg config) error {
 		opts = append(opts, proxy.WithExcludedHosts(suffixes...))
 	}
 	// Origin filter: intercept only the simulator (or a named app) and tunnel
-	// everything else untouched. Off unless the user asks (spec 009), or forced on
-	// by -system-proxy (spec 010).
-	if filter := origin.BuildFilter(onlySim, cfg.apps); filter.Active() {
-		opts = append(opts, proxy.WithOriginFilter(origin.Resolve, filter))
+	// everything else untouched. When the UI is on, read it live from the Controller
+	// so a selection change takes effect on the next connection; otherwise it is the
+	// fixed flag-built filter, wired only when it actually narrows something.
+	switch {
+	case controller != nil:
+		opts = append(opts, proxy.WithOriginFilterFunc(origin.Resolve, controller.Current))
+	case seed.Active():
+		opts = append(opts, proxy.WithOriginFilter(origin.Resolve, seed))
 	}
 	handler := proxy.New(sink, authority, opts...)
 

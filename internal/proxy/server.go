@@ -50,12 +50,14 @@ type Server struct {
 	// excluded holds user-configured host suffixes that are always tunnelled.
 	excluded []string
 
-	// resolveOrigin and originFilter, when set, restrict interception to
-	// connections from matching processes (the simulator, or a named app);
-	// non-matching connections are tunnelled silently. resolveOrigin is nil when
-	// the feature is off, which is the default (spec 009).
+	// resolveOrigin and filter, when set, restrict interception to connections
+	// from matching processes (the simulator, or a named app); non-matching
+	// connections are tunnelled silently. resolveOrigin is nil when the feature is
+	// off, which is the default (spec 009). filter is read per connection so the
+	// selection can change at runtime from the UI (spec 011); when it currently
+	// reports inactive, origin resolution is skipped entirely (intercept all).
 	resolveOrigin origin.Resolver
-	originFilter  origin.Filter
+	filter        func() origin.Filter
 
 	// learned holds hosts observed to reject our leaf (pinned apps). After the
 	// first failed interception a host lands here and is tunnelled thereafter.
@@ -83,12 +85,27 @@ func WithExcludedHosts(suffixes ...string) Option {
 // process the resolver attributes and the filter accepts (e.g. only the
 // simulator, or one app). Non-matching connections are blind-tunnelled and never
 // surfaced as flows. Passing an inactive filter, or a nil resolver, leaves
-// interception unrestricted — the feature is off by default (spec 009).
+// interception unrestricted — the feature is off by default (spec 009). The
+// filter is fixed for the process; WithOriginFilterFunc makes it runtime-mutable.
 func WithOriginFilter(r origin.Resolver, f origin.Filter) Option {
 	return func(s *Server) {
 		if r != nil && f.Active() {
 			s.resolveOrigin = r
-			s.originFilter = f
+			s.filter = func() origin.Filter { return f }
+		}
+	}
+}
+
+// WithOriginFilterFunc is WithOriginFilter with a filter read fresh on every
+// connection, so the UI can re-scope capture at runtime (spec 011). Unlike the
+// fixed form it wires the resolver in even when the filter is currently inactive,
+// because the user may activate it later; while it reports inactive, origin
+// resolution is skipped and everything is intercepted (the fast path is kept).
+func WithOriginFilterFunc(r origin.Resolver, current func() origin.Filter) Option {
+	return func(s *Server) {
+		if r != nil && current != nil {
+			s.resolveOrigin = r
+			s.filter = current
 		}
 	}
 }
@@ -154,6 +171,13 @@ func (s *Server) originAllows(r *http.Request) bool {
 	if s.resolveOrigin == nil {
 		return true
 	}
+	// Read the filter in force for this connection. An inactive filter means
+	// "intercept everything" — and, crucially, we resolve nothing in that case, so
+	// turning the filter off from the UI costs exactly what it did before 009.
+	f := s.filter()
+	if !f.Active() {
+		return true
+	}
 	local, _ := r.Context().Value(http.LocalAddrContextKey).(net.Addr)
 	remote, err := net.ResolveTCPAddr("tcp", r.RemoteAddr)
 	if err != nil {
@@ -163,7 +187,7 @@ func (s *Server) originAllows(r *http.Request) bool {
 	if err != nil {
 		return false
 	}
-	return s.originFilter.Match(p)
+	return f.Match(p)
 }
 
 // forward relays one request upstream. scheme is the flow's scheme; r.URL must

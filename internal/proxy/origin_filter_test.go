@@ -5,6 +5,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 
 	"proxysim/internal/origin"
@@ -122,6 +123,83 @@ func TestOriginFilterAppAllowAndDeny(t *testing.T) {
 	respB.Body.Close()
 	if n := len(sinkB.all()); n != 0 {
 		t.Errorf("app B produced %d flows, want 0", n)
+	}
+}
+
+// Spec 011, criterion 1: the filter is read per connection through a provider, so
+// flipping it on at runtime takes effect on the next connection. First request
+// under an inactive filter is intercepted; after the controller is set to
+// only-sim, a host-process connection is tunnelled silently.
+func TestOriginFilterFuncMutableAtRuntime(t *testing.T) {
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hi")
+	}))
+	defer up.Close()
+
+	a := testAuthority(t)
+	sink := &capSink{}
+	ctrl := origin.NewController(origin.Filter{}) // inactive: intercept everything
+	front := httptest.NewServer(New(sink, a,
+		insecureUpstream(),
+		WithOriginFilterFunc(fixedResolver(hostProc, nil), ctrl.Current),
+	))
+	defer front.Close()
+
+	// Filter off: the host-process connection is intercepted like any other.
+	resp, err := httpsProxyClient(t, front, caPool(a)).Get(up.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	waitForFlows(t, sink, 1)
+	if !sink.all()[0].Intercepted {
+		t.Fatal("with the filter inactive, the connection should be intercepted")
+	}
+
+	// Flip to only-sim at runtime: the same host process no longer matches, so the
+	// next connection is blind-tunnelled and produces no further flow.
+	ctrl.Set(origin.BuildFilter(true, nil))
+	resp2, err := httpsProxyClient(t, front, originPool(up)).Get(up.URL + "/y")
+	if err != nil {
+		t.Fatalf("host traffic must still flow through a tunnel after the switch: %v", err)
+	}
+	resp2.Body.Close()
+	if n := len(sink.all()); n != 1 {
+		t.Errorf("after switching to only-sim, host connection produced %d total flows, want 1 (the first)", n)
+	}
+}
+
+// Spec 011, criterion 10: an inactive filter costs nothing — the resolver is not
+// even called, preserving spec 009's fast path.
+func TestOriginFilterFuncInactiveSkipsResolver(t *testing.T) {
+	up := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, "hi")
+	}))
+	defer up.Close()
+
+	var resolved atomic.Bool
+	spyResolver := func(_, _ net.Addr) (origin.Process, error) {
+		resolved.Store(true)
+		return hostProc, nil
+	}
+
+	a := testAuthority(t)
+	sink := &capSink{}
+	ctrl := origin.NewController(origin.Filter{}) // inactive
+	front := httptest.NewServer(New(sink, a,
+		insecureUpstream(),
+		WithOriginFilterFunc(spyResolver, ctrl.Current),
+	))
+	defer front.Close()
+
+	resp, err := httpsProxyClient(t, front, caPool(a)).Get(up.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	waitForFlows(t, sink, 1)
+	if resolved.Load() {
+		t.Error("resolver must not be called while the filter is inactive")
 	}
 }
 

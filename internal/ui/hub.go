@@ -7,17 +7,22 @@
 package ui
 
 import (
+	"context"
 	"embed"
 	"encoding/json"
 	"fmt"
 	"io/fs"
 	"net"
 	"net/http"
+	"sort"
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"proxysim/internal/flow"
+	"proxysim/internal/origin"
+	"proxysim/internal/sim"
 )
 
 //go:embed app
@@ -56,6 +61,13 @@ type Hub struct {
 	clients  map[*client]struct{}
 
 	app http.Handler
+
+	// Runtime origin control (spec 011), wired via SetControl only when the UI
+	// serves. While nil, the /sims, /filter, … endpoints report "not enabled" —
+	// the UI is otherwise a read-only viewer, exactly as spec 008.
+	filter   *origin.Controller
+	listSims func(context.Context) ([]sim.Device, error)
+	listApps func(context.Context, string) ([]sim.App, error)
 }
 
 // New returns a Hub buffering the last history completed flows. A non-positive
@@ -118,13 +130,30 @@ func (h *Hub) Dropped() uint64 {
 	return total
 }
 
+// SetControl wires the runtime origin filter and the simulator/app enumeration
+// the control bar drives (spec 011). Called once at startup when the UI is
+// enabled; without it the control endpoints report that control is off. The
+// enumerators take a context so a slow simctl cannot wedge a request.
+func (h *Hub) SetControl(filter *origin.Controller, sims func(context.Context) ([]sim.Device, error), apps func(context.Context, string) ([]sim.App, error)) {
+	h.filter = filter
+	h.listSims = sims
+	h.listApps = apps
+}
+
 // Handler serves the app at /, the live SSE stream at /events, the buffered
-// history at /flows, and one flow in full at /flows/{id}.
+// history at /flows, one flow in full at /flows/{id}, and — when origin control is
+// wired — the simulator/app enumeration and the live filter (spec 011). The
+// control routes are always registered but reflect "not enabled" until SetControl
+// runs, so the same handler works with or without control.
 func (h *Hub) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /events", h.handleEvents)
 	mux.HandleFunc("GET /flows", h.handleFlows)
 	mux.HandleFunc("GET /flows/{id}", h.handleDetail)
+	mux.HandleFunc("GET /sims", h.handleSims)
+	mux.HandleFunc("GET /sims/{udid}/apps", h.handleApps)
+	mux.HandleFunc("GET /filter", h.handleGetFilter)
+	mux.HandleFunc("PUT /filter", h.handleSetFilter)
 	mux.Handle("GET /", h.app)
 	return mux
 }
@@ -160,6 +189,112 @@ func (h *Hub) handleDetail(w http.ResponseWriter, r *http.Request) {
 
 	w.Header().Set("Content-Type", "application/json")
 	json.NewEncoder(w).Encode(buildDetail(f))
+}
+
+// filterJSON is the wire shape of the live origin filter, both directions. It
+// mirrors the -only-sim/-app flags: onlySim narrows to the simulator, apps to
+// specific bundle ids (a non-empty apps set implies onlySim, per spec 009).
+type filterJSON struct {
+	OnlySim bool     `json:"onlySim"`
+	Apps    []string `json:"apps"`
+}
+
+// handleSims lists the booted simulators for the control bar. An empty set is a
+// normal state (no sim booted yet), returned as [] rather than an error, so the
+// bar can degrade rather than the page break.
+func (h *Hub) handleSims(w http.ResponseWriter, r *http.Request) {
+	if h.listSims == nil {
+		controlDisabled(w)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	devices, err := h.listSims(ctx)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	type simJSON struct {
+		UDID    string `json:"udid"`
+		Name    string `json:"name"`
+		Runtime string `json:"runtime"`
+	}
+	out := make([]simJSON, 0, len(devices))
+	for _, d := range devices {
+		out = append(out, simJSON{UDID: d.UDID, Name: d.Name, Runtime: d.Runtime})
+	}
+	writeJSON(w, out)
+}
+
+// handleApps lists a simulator's installed user apps for the app dropdown.
+func (h *Hub) handleApps(w http.ResponseWriter, r *http.Request) {
+	if h.listApps == nil {
+		controlDisabled(w)
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 15*time.Second)
+	defer cancel()
+	apps, err := h.listApps(ctx, r.PathValue("udid"))
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	if apps == nil {
+		apps = []sim.App{}
+	}
+	writeJSON(w, apps)
+}
+
+// handleGetFilter returns the filter currently in force, so a freshly loaded (or
+// second) tab reflects a flag-set or previously-chosen selection.
+func (h *Hub) handleGetFilter(w http.ResponseWriter, r *http.Request) {
+	if h.filter == nil {
+		controlDisabled(w)
+		return
+	}
+	writeJSON(w, toFilterJSON(h.filter.Current()))
+}
+
+// handleSetFilter replaces the live filter. It validates the request shape, not
+// the existence of the named apps: a bundle id for an app not yet launched is
+// accepted and simply matches once that app runs (spec 009's safe direction), so
+// the filter is never coupled to the enumerated list.
+func (h *Hub) handleSetFilter(w http.ResponseWriter, r *http.Request) {
+	if h.filter == nil {
+		controlDisabled(w)
+		return
+	}
+	var body filterJSON
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid filter body", http.StatusBadRequest)
+		return
+	}
+	f := origin.BuildFilter(body.OnlySim, body.Apps)
+	h.filter.Set(f)
+	writeJSON(w, toFilterJSON(f))
+}
+
+// toFilterJSON renders a Filter for the wire, its bundle-id set as a sorted slice
+// for a stable response.
+func toFilterJSON(f origin.Filter) filterJSON {
+	apps := make([]string, 0, len(f.Apps))
+	for id := range f.Apps {
+		apps = append(apps, id)
+	}
+	sort.Strings(apps)
+	return filterJSON{OnlySim: f.OnlySim, Apps: apps}
+}
+
+func writeJSON(w http.ResponseWriter, v any) {
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(v)
+}
+
+// controlDisabled answers the control endpoints when SetControl was never called
+// (the UI is a read-only viewer). 501 says "this server does not offer it", as
+// distinct from a 404 for an unknown route.
+func controlDisabled(w http.ResponseWriter) {
+	http.Error(w, "origin control not enabled", http.StatusNotImplemented)
 }
 
 // handleEvents streams completed flows to the browser as they are emitted, over

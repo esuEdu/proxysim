@@ -16,6 +16,20 @@
     <button id="clear" type="button">Clear</button>
   </header>
 
+  <div id="control" hidden>
+    <label class="ctl">Simulator
+      <select id="sim-select"><option value="">no booted simulator</option></select>
+    </label>
+    <label class="ctl">Intercept
+      <select id="app-select">
+        <option value="__all__">Everything (no filter)</option>
+        <option value="__sim__">All simulator traffic</option>
+      </select>
+    </label>
+    <span id="scope" class="scope"></span>
+    <button id="sim-refresh" type="button" title="reload simulators and apps">↻</button>
+  </div>
+
   <main>
     <section id="list" aria-label="captured flows">
       <table>
