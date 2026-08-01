@@ -3,8 +3,9 @@
 A local HTTP/HTTPS forward proxy and traffic sniffer for the iOS Simulator.
 Charles/Proxyman in miniature, built to be understood rather than to be complete.
 
-**Status:** specs 001–008 implemented. Proxy, TLS interception, body decoding,
-`simctl` trust automation, and a live web UI all work end-to-end.
+**Status:** specs 001–011 implemented. Proxy, TLS interception, body decoding,
+`simctl` trust automation, a live web UI, origin filtering, automatic system-proxy
+takeover, and in-UI simulator/app selection all work end-to-end.
 
 ## Quick start
 
@@ -13,6 +14,13 @@ go build -o proxysim .
 
 # first run generates the CA under -ca-dir; leave it running (Ctrl-C to stop)
 ./proxysim -port 8888 -ui -ui-port 8889 -ca-dir ~/.proxysim
+```
+
+For the Simulator, the friendly one-command path trusts the CA, takes over the
+macOS system proxy (and restores it on exit), and scopes capture to the simulator:
+
+```bash
+./proxysim -system-proxy -ui        # then just open the UI and pick your app
 ```
 
 Then, in another terminal:
@@ -43,9 +51,15 @@ and click one for its headers and decoded bodies.
 | `-ui-history` | `1000` | recent flows the UI keeps for a freshly opened tab |
 | `-only-sim` | `false` | intercept only iOS Simulator traffic; tunnel everything else (macOS) |
 | `-app` | — | comma-separated app bundle ids to intercept exclusively (implies `-only-sim`) |
+| `-system-proxy` | `false` | point the macOS system proxy at proxysim on startup, restore it on exit (implies `-only-sim`) |
+| `-no-trust` | `false` | skip auto-trusting the CA in the booted simulator on startup |
 | `-trust` | `false` | install the CA into the booted simulator's trust store, then exit |
 | `-trust-set` | — | simulator set to target (e.g. `previews` for Xcode Previews) |
 | `-device` | — | UDID of the booted simulator, when several are booted |
+
+On startup proxysim auto-trusts the CA in the booted simulator (idempotent,
+best-effort — a missing simulator or Xcode just prints a skip line). `-no-trust`
+turns that off; `-trust` is the standalone install-and-exit form.
 
 ## The web UI
 
@@ -57,77 +71,81 @@ and click one for its headers and decoded bodies.
 - Click a row for headers plus **decoded** bodies — gzip/deflate/brotli
   decompressed, JSON pretty-printed, binary summarized. The raw (on-wire) size is
   reported alongside the decoded view.
+- A control bar picks the **simulator** and what to **intercept** — *Everything*,
+  *All simulator traffic* (`-only-sim`), or one app from a dropdown of the booted
+  sim's installed apps. The change applies to the next connection, no restart. It
+  reflects whatever `-only-sim`/`-app` you launched with, and any tab stays in
+  sync. (The bar appears only when the origin filter is available — i.e. with the
+  UI on.)
 - Loopback only, no auth: it serves decrypted traffic, so it is never reachable
   from the network. This is not configurable — see `CLAUDE.md`.
 
 ## Testing against the iOS Simulator
 
 The Simulator routes through the **host Mac's** network stack, so it inherits
-macOS system proxy settings. Two steps: trust the CA, and point the system proxy
-at us.
+macOS system proxy settings. proxysim automates every step of that setup — and,
+crucially, the teardown.
+
+### The easy path
 
 ```bash
-# 1) trust the CA in the booted simulator (folded into the tool)
-./proxysim -trust -ca-dir ~/.proxysim
-#    SwiftUI Previews uses a separate simulator set:
-./proxysim -trust -trust-set previews
-#    several sims booted? it lists them; pick one:
-./proxysim -trust -device <UDID>
+./proxysim -system-proxy -ui
+```
 
-# 2) route the Mac's web traffic through the proxy (manual for now)
+This, on startup: auto-trusts the CA in the booted simulator; points the Mac's
+system proxy at proxysim; and — because a global system proxy would drag Safari
+and every daemon through us — scopes capture to the simulator (`-only-sim` is
+implied). On `Ctrl-C` it **restores the system proxy to exactly its prior state**.
+Open the UI, and pick *All simulator traffic* or one app from the control bar's
+dropdown — no restart, no bundle-id lookup.
+
+If a previous run was killed (`kill -9`, crash) before restoring, the next
+`-system-proxy` startup restores from an on-disk snapshot before re-applying, so a
+stale proxy never lingers.
+
+### Choosing what to capture
+
+Everything below the simulator scope is a filter over the **originating process**;
+non-matching connections are blind-tunnelled (they still work), just neither
+decrypted nor shown. Pick it in the UI, or pin it from the command line:
+
+```bash
+./proxysim -system-proxy -ui                          # pick sim/app in the UI (recommended)
+./proxysim -system-proxy -ui -only-sim                # whole simulator, fixed
+./proxysim -system-proxy -ui -app br.com.bb.InvestimentosBB   # one app, fixed
+# → its API calls (api.mov.investimentos.hm.bb.com.br, firebase, appdynamics…) are
+#   captured; Safari and every other app are tunnelled + hidden.
+```
+
+Per-app matches the app's own `URLSession`/`CFNetwork` traffic, which resolves to
+the app process. Two things it does **not** catch: `WKWebView` traffic (it runs in
+WebKit's networking process, not your app — use *All simulator traffic* to see
+it), and any background session that egresses through a shared daemon. macOS only.
+
+### The manual path (fallback)
+
+If you'd rather drive the system proxy yourself (or you're not on the primary
+network service proxysim auto-detects), skip `-system-proxy` and set it by hand:
+
+```bash
 networksetup -setsecurewebproxy Wi-Fi 127.0.0.1 8888
 networksetup -setwebproxy       Wi-Fi 127.0.0.1 8888
-```
-
-Because the system proxy is global, host traffic (Safari, daemons) routes through
-proxysim too. Narrow capture to just the simulator, or one app, by originating
-process:
-
-```bash
-./proxysim -ui -only-sim                     # only Simulator traffic; host tunnelled + hidden
-./proxysim -ui -app com.you.MyApp            # only that app; everything else tunnelled + hidden
-```
-
-Find an installed app's bundle id from the booted simulator:
-
-```bash
-# list every installed app's bundle id and name
-xcrun simctl listapps booted | plutil -convert json -o - - \
-  | python3 -c 'import sys,json; [print(k, "—", v.get("CFBundleDisplayName") or v.get("CFBundleName","")) for k,v in json.load(sys.stdin).items()]'
-```
-
-Then target it — e.g. a real run against the "Investimentos BB" app:
-
-```bash
-./proxysim -ui -app br.com.bb.InvestimentosBB
-# → its API calls (api.mov.investimentos.hm.bb.com.br, firebase, appdynamics…) are
-#   captured; Safari and every other app on the same system proxy are tunnelled + hidden.
-```
-
-Non-matching connections are blind-tunnelled (they still work), just neither
-decrypted nor shown. Per-app matches the app's own `URLSession`/`CFNetwork`
-traffic, which resolves to the app process. Two things it does **not** catch:
-`WKWebView` traffic (it runs in WebKit's networking process, not your app — use
-`-only-sim` to see it), and any background session that egresses through a shared
-daemon. macOS only.
-
-Run your app in the Simulator and watch traffic in the UI. **Revert the system
-proxy when done**, or all Mac traffic keeps routing through proxysim:
-
-```bash
-networksetup -setsecurewebproxystate Wi-Fi off
-networksetup -setwebproxystate       Wi-Fi off
+# ... test ...
+networksetup -setsecurewebproxystate Wi-Fi off        # revert when done, or Mac
+networksetup -setwebproxystate       Wi-Fi off        # traffic keeps routing through us
 ```
 
 Notes:
 
-- `-trust` needs Xcode's command-line tools and a **booted** simulator; it prints
-  an actionable error otherwise (no Xcode, no booted device, ambiguous choice).
-- Trust does not survive `simctl erase`. Re-run `./proxysim -trust` after
-  resetting a device.
-- System-proxy automation is deliberately **not** in the tool yet: it reroutes
-  *all* Mac traffic and must be reliably reverted, so it is left manual pending
-  its own spec with a restore-on-exit guarantee.
+- Auto-trust (and standalone `-trust`) need Xcode's command-line tools and a
+  **booted** simulator; both print an actionable skip/error otherwise (no Xcode,
+  no booted device, ambiguous choice). SwiftUI Previews uses a separate set —
+  `-trust -trust-set previews`; several sims booted — `-trust -device <UDID>`.
+- Trust does not survive `simctl erase`. Startup auto-trust re-installs it on the
+  next run; or run `./proxysim -trust` after resetting a device.
+- `-system-proxy` takes over the **primary** network service (the one backing the
+  default route). If it can't (no admin rights, offline), it prints a hint and
+  keeps serving so you can set the proxy manually.
 - A pinned host cannot be intercepted by design. proxysim falls back to a blind
   TCP tunnel and logs it as `[tunnelled, not inspected]` — never failing the
   connection. Add such hosts to `-exclude` to skip the interception attempt.
@@ -162,6 +180,8 @@ and pass.
 | 007 | `simctl` trust automation | done |
 | 008 | Desktop UI | done |
 | 009 | Origin filtering (simulator / per-app) | done |
+| 010 | Frictionless launch (system proxy + CA auto-trust) | done |
+| 011 | UI-driven simulator/app origin control | done |
 
 Each spec carries a human-run manual criterion (real simulator, real browser)
 that the automated tests do not cover; those are yours to exercise via the steps

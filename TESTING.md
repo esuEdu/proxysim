@@ -1,12 +1,11 @@
 # Testing proxysim against the Simulator — quick guide
 
 A minimal, repeatable checklist. Assumes a booted simulator and Xcode CLT.
-Ports: proxy `8888`, UI `8889`. Network service: `Wi-Fi` (swap for `Ethernet` if
-that's what you're on: `networksetup -listallnetworkservices`).
+Ports: proxy `8888`, UI `8889`.
 
-> ⚠️ The one thing that bites: routing the sim sets the **system-wide** proxy, so
-> **you must turn it back off when done** (Step 5) or your Mac's web traffic
-> breaks. The stop block below does it; the `run.sh` option does it automatically.
+With `-system-proxy`, proxysim now trusts the CA, sets the macOS system proxy, and
+**restores it on exit** for you — so the old "remember to turn the proxy back off"
+footgun is handled. The manual path is still here as a fallback.
 
 ---
 
@@ -15,33 +14,27 @@ that's what you're on: `networksetup -listallnetworkservices`).
 ```bash
 cd ~/Documents/git/proxysim
 go build -o proxysim .
-./proxysim -port 8888 -ca-dir ~/.proxysim &   # first run generates the CA; Ctrl-C or `kill %1` after
-sleep 2 && kill %1 2>/dev/null                 # (just needed it to create ~/.proxysim/ca.crt)
-./proxysim -trust -ca-dir ~/.proxysim          # trust the CA in the booted simulator
 ```
 
-Re-run only `-trust` after a `simctl erase`.
+The first run generates the CA under `~/.proxysim` and auto-trusts it in the
+booted simulator; there's no separate bootstrap step. (Re-run `./proxysim -trust`
+only if you `simctl erase` a device and don't want to restart proxysim.)
 
 ---
 
-## Each test session
+## Each test session — the easy path
 
-**1. Start proxysim** — pick one:
-
-```bash
-./proxysim -ui -ca-dir ~/.proxysim -app br.com.bb.InvestimentosBB   # just your app
-# or
-./proxysim -ui -ca-dir ~/.proxysim -only-sim                        # the whole simulator
-```
-
-**2. Point the simulator's traffic at it** (this is the system-wide part):
+**1. Start proxysim (it trusts the CA, sets + later restores the system proxy):**
 
 ```bash
-networksetup -setsecurewebproxy Wi-Fi 127.0.0.1 8888
-networksetup -setwebproxy       Wi-Fi 127.0.0.1 8888
+./proxysim -system-proxy -ui -ca-dir ~/.proxysim
 ```
 
-**3. Open the UI:** http://127.0.0.1:8889
+**2. Open the UI:** http://127.0.0.1:8889
+
+**3. Pick what to capture** in the control bar: the simulator, then *All simulator
+traffic* or one app from the dropdown. No restart — it applies to the next
+connection. (Prefer flags? add `-app br.com.bb.InvestimentosBB` or `-only-sim`.)
 
 **4. Drive the app** in the simulator — tap around, or:
 
@@ -51,12 +44,33 @@ xcrun simctl launch booted br.com.bb.InvestimentosBB   # (re)launch to see start
 
 Rows appear live; click one for headers + decoded body.
 
-**5. STOP — revert the proxy, then quit proxysim:**
+**5. STOP:** just `Ctrl-C` proxysim. It restores the system proxy to its prior
+state automatically. Sanity-check if you like:
 
 ```bash
+networksetup -getsecurewebproxy Wi-Fi | head -1   # back to its previous "Enabled: …"
+```
+
+If a run is ever killed with `kill -9`, the next `./proxysim -system-proxy` startup
+restores the system proxy from an on-disk snapshot before re-applying — so a stale
+proxy never lingers.
+
+---
+
+## Each test session — the manual path (fallback)
+
+If you'd rather not have proxysim touch the system proxy (e.g. you're on an unusual
+network service), drop `-system-proxy` and drive it yourself. Network service:
+`Wi-Fi` (swap for `Ethernet`: `networksetup -listallnetworkservices`).
+
+```bash
+./proxysim -ui -ca-dir ~/.proxysim -app br.com.bb.InvestimentosBB   # or -only-sim
+networksetup -setsecurewebproxy Wi-Fi 127.0.0.1 8888
+networksetup -setwebproxy       Wi-Fi 127.0.0.1 8888
+# ... test in the UI ...
+# ⚠️ revert when done, or your Mac's web traffic keeps routing through proxysim:
 networksetup -setsecurewebproxystate Wi-Fi off
 networksetup -setwebproxystate       Wi-Fi off
-# then Ctrl-C proxysim (or: kill %1)
 networksetup -getsecurewebproxy Wi-Fi | head -1   # sanity: "Enabled: No"
 ```
 
@@ -65,7 +79,7 @@ networksetup -getsecurewebproxy Wi-Fi | head -1   # sanity: "Enabled: No"
 ## Handy
 
 ```bash
-# find any installed app's bundle id
+# find any installed app's bundle id (or just pick it from the UI dropdown)
 xcrun simctl listapps booted | plutil -convert json -o - - \
   | python3 -c 'import sys,json; [print(k,"—",v.get("CFBundleDisplayName") or v.get("CFBundleName","")) for k,v in json.load(sys.stdin).items()]'
 
@@ -74,37 +88,10 @@ xcrun simctl list devices booted
 ```
 
 **Notes**
-- `-app` captures the app's own `URLSession`/`CFNetwork` calls. `WKWebView`
-  traffic won't show under `-app` (it runs in WebKit's networking process) —
-  use `-only-sim` to see it.
+- `-app` (and the UI's per-app choice) capture the app's own
+  `URLSession`/`CFNetwork` calls. `WKWebView` traffic won't show under a single
+  app (it runs in WebKit's networking process) — use *All simulator traffic* /
+  `-only-sim` to see it.
 - Non-matching traffic is tunnelled (still works), just hidden.
-
----
-
-## Optional: one-shot script that auto-reverts
-
-Save as `run.sh`, `chmod +x run.sh`, then `./run.sh br.com.bb.InvestimentosBB`.
-It reverts the system proxy on exit no matter how you quit (Ctrl-C included).
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-BUNDLE="${1:-}"; PORT=8888; UIPORT=8889; SVC=Wi-Fi
-cd "$(dirname "$0")"
-go build -o proxysim .
-
-filter=(-only-sim); [ -n "$BUNDLE" ] && filter=(-app "$BUNDLE")
-./proxysim -port "$PORT" -ui -ui-port "$UIPORT" -ca-dir ~/.proxysim "${filter[@]}" &
-PX=$!
-cleanup() {
-  networksetup -setsecurewebproxystate "$SVC" off 2>/dev/null || true
-  networksetup -setwebproxystate       "$SVC" off 2>/dev/null || true
-  kill "$PX" 2>/dev/null || true
-}
-trap cleanup EXIT INT TERM
-sleep 1
-networksetup -setsecurewebproxy "$SVC" 127.0.0.1 "$PORT"
-networksetup -setwebproxy       "$SVC" 127.0.0.1 "$PORT"
-echo "proxysim up. UI: http://127.0.0.1:$UIPORT   (Ctrl-C to stop and auto-revert the proxy)"
-wait "$PX"
-```
+- `-system-proxy` implies `-only-sim`, so host apps (Safari, daemons) are
+  tunnelled untouched — never decrypted — even though the system proxy is global.
