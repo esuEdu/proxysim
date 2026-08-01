@@ -25,6 +25,7 @@ import (
 	"proxysim/internal/flow"
 	"proxysim/internal/proxy"
 	"proxysim/internal/sim"
+	"proxysim/internal/ui"
 )
 
 func main() {
@@ -35,6 +36,9 @@ func main() {
 	trust := flag.Bool("trust", false, "install the CA into the booted simulator's trust store, then exit (does not serve)")
 	trustSet := flag.String("trust-set", "", "simulator set to target (e.g. \"previews\" for Xcode Previews); default set when empty")
 	device := flag.String("device", "", "UDID of the booted simulator to target when several are booted")
+	ui := flag.Bool("ui", false, "serve the live traffic web UI (loopback only, separate port)")
+	uiPort := flag.Int("ui-port", 8889, "port for the web UI (always bound to 127.0.0.1)")
+	uiHistory := flag.Int("ui-history", 1000, "number of recent flows the UI keeps for a freshly opened tab")
 	flag.Parse()
 
 	// -trust is a one-shot action: install and exit, never bind a listener.
@@ -45,9 +49,30 @@ func main() {
 		return
 	}
 
-	if err := run(*port, *caDir, *verbose, *exclude); err != nil {
+	cfg := config{
+		port:      *port,
+		caDir:     *caDir,
+		verbose:   *verbose,
+		exclude:   *exclude,
+		ui:        *ui,
+		uiPort:    *uiPort,
+		uiHistory: *uiHistory,
+	}
+	if err := run(cfg); err != nil {
 		log.Fatalf("proxysim: %v", err)
 	}
+}
+
+// config is the resolved serving configuration, threaded into run so the
+// signature stays readable as options accrue.
+type config struct {
+	port      int
+	caDir     string
+	verbose   bool
+	exclude   string
+	ui        bool
+	uiPort    int
+	uiHistory int
 }
 
 // trustCA installs the machine-local CA into a booted simulator's trust store.
@@ -76,8 +101,8 @@ func trustCA(caDir, set, device string) error {
 	return nil
 }
 
-func run(port int, caDir string, verbose bool, exclude string) error {
-	dir, err := expandPath(caDir)
+func run(cfg config) error {
+	dir, err := expandPath(cfg.caDir)
 	if err != nil {
 		return err
 	}
@@ -90,16 +115,31 @@ func run(port int, caDir string, verbose bool, exclude string) error {
 	// Bind loopback only. A MITM proxy reachable from the network is a genuine
 	// hazard, so this address is not configurable — not behind a flag, not for
 	// testing (see CLAUDE.md).
-	addr := net.JoinHostPort("127.0.0.1", fmt.Sprint(port))
+	addr := net.JoinHostPort("127.0.0.1", fmt.Sprint(cfg.port))
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("listening on %s: %w", addr, err)
 	}
 
-	sink := flow.NewConsoleSink(os.Stdout, verbose)
+	// The console is always a consumer. The UI, when enabled, is simply another
+	// flow.Sink alongside it — the proxy does not know it exists (spec 008). Its
+	// Emit is non-blocking (drops per client), so it sits directly in the fan-out
+	// with no AsyncSink wrapper needed.
+	var sink flow.Sink = flow.NewConsoleSink(os.Stdout, cfg.verbose)
+	var uiSrv *http.Server
+	var uiLn net.Listener
+	if cfg.ui {
+		hub := ui.New(cfg.uiHistory)
+		sink = flow.MultiSink{sink, hub}
+		uiLn, err = ui.Listen(cfg.uiPort)
+		if err != nil {
+			return err
+		}
+		uiSrv = &http.Server{Handler: hub.Handler()}
+	}
 
 	var opts []proxy.Option
-	if suffixes := splitSuffixes(exclude); len(suffixes) > 0 {
+	if suffixes := splitSuffixes(cfg.exclude); len(suffixes) > 0 {
 		opts = append(opts, proxy.WithExcludedHosts(suffixes...))
 	}
 	handler := proxy.New(sink, authority, opts...)
@@ -107,25 +147,40 @@ func run(port int, caDir string, verbose bool, exclude string) error {
 	srv := &http.Server{Handler: handler}
 
 	printBanner(addr, dir, authority)
+	if uiLn != nil {
+		fmt.Fprintf(os.Stderr, "UI:          http://%s\n\n", uiLn.Addr())
+	}
 
 	// Serve until a signal arrives, then shut down gracefully.
 	errCh := make(chan error, 1)
 	go func() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
+			errCh <- fmt.Errorf("serving proxy: %w", err)
 		}
 	}()
+	if uiSrv != nil {
+		go func() {
+			if err := uiSrv.Serve(uiLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				errCh <- fmt.Errorf("serving UI: %w", err)
+			}
+		}()
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	select {
 	case err := <-errCh:
-		return fmt.Errorf("serving: %w", err)
+		return err
 	case <-ctx.Done():
 		fmt.Fprintln(os.Stderr, "\nproxysim: shutting down")
 		shutCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
+		if uiSrv != nil {
+			// SSE clients hold their connections open, so Shutdown would block on
+			// them for the full timeout; Close drops them promptly instead.
+			uiSrv.Close()
+		}
 		// Hijacked CONNECT tunnels are not tracked by Shutdown; this drains the
 		// plain-HTTP side and returns promptly regardless.
 		return srv.Shutdown(shutCtx)

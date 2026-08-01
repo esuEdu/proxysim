@@ -7,11 +7,12 @@ import (
 	"net/http"
 	"os"
 	"reflect"
-	"sort"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"proxysim/internal/flow/flowtest"
 )
 
 // Criterion 1: a populated flow round-trips through JSON unchanged, including a
@@ -50,7 +51,9 @@ func TestFlowJSONRoundTrip(t *testing.T) {
 }
 
 // Criterion 2: the JSON key set is a stable contract. This golden test fails if
-// a field is renamed or dropped — that is its entire purpose.
+// a field is renamed or dropped — that is its entire purpose. It compares against
+// flowtest.GoldenFieldSet, the same list the UI (spec 008) asserts against, so a
+// tag change breaks both consumers together rather than only here.
 func TestFlowJSONFieldSet(t *testing.T) {
 	// Every field non-zero so omitempty ones (bodies, error) are present.
 	f := Flow{
@@ -60,29 +63,9 @@ func TestFlowJSONFieldSet(t *testing.T) {
 		StatusCode: 200, ResponseHeaders: http.Header{}, ResponseBody: []byte("y"), ResponseTruncated: true,
 		Intercepted: true, Error: "boom",
 	}
-	data, err := json.Marshal(f)
-	if err != nil {
-		t.Fatal(err)
-	}
-	var m map[string]json.RawMessage
-	if err := json.Unmarshal(data, &m); err != nil {
-		t.Fatal(err)
-	}
-	got := make([]string, 0, len(m))
-	for k := range m {
-		got = append(got, k)
-	}
-	sort.Strings(got)
-
-	want := []string{
-		"duration_ns", "error", "host", "id", "intercepted", "method", "path",
-		"request_body", "request_headers", "request_truncated",
-		"response_body", "response_headers", "response_truncated",
-		"scheme", "started", "status_code",
-	}
-	sort.Strings(want)
-	if !reflect.DeepEqual(got, want) {
-		t.Errorf("JSON field set changed.\n got = %v\nwant = %v", got, want)
+	got := flowtest.FieldSet(t, f)
+	if !reflect.DeepEqual(got, flowtest.GoldenFieldSet) {
+		t.Errorf("JSON field set changed.\n got = %v\nwant = %v", got, flowtest.GoldenFieldSet)
 	}
 }
 
