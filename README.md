@@ -88,11 +88,28 @@ process:
 ./proxysim -ui -app com.you.MyApp            # only that app; everything else tunnelled + hidden
 ```
 
+Find an installed app's bundle id from the booted simulator:
+
+```bash
+# list every installed app's bundle id and name
+xcrun simctl listapps booted | plutil -convert json -o - - \
+  | python3 -c 'import sys,json; [print(k, "—", v.get("CFBundleDisplayName") or v.get("CFBundleName","")) for k,v in json.load(sys.stdin).items()]'
+```
+
+Then target it — e.g. a real run against the "Investimentos BB" app:
+
+```bash
+./proxysim -ui -app br.com.bb.InvestimentosBB
+# → its API calls (api.mov.investimentos.hm.bb.com.br, firebase, appdynamics…) are
+#   captured; Safari and every other app on the same system proxy are tunnelled + hidden.
+```
+
 Non-matching connections are blind-tunnelled (they still work), just neither
-decrypted nor shown. Per-app relies on the app opening its own sockets, which
-holds for foreground `URLSession` traffic; background sessions that egress via a
-shared daemon may resolve to the daemon rather than the app — `-only-sim` still
-catches those. macOS only.
+decrypted nor shown. Per-app matches the app's own `URLSession`/`CFNetwork`
+traffic, which resolves to the app process. Two things it does **not** catch:
+`WKWebView` traffic (it runs in WebKit's networking process, not your app — use
+`-only-sim` to see it), and any background session that egresses through a shared
+daemon. macOS only.
 
 Run your app in the Simulator and watch traffic in the UI. **Revert the system
 proxy when done**, or all Mac traffic keeps routing through proxysim:
