@@ -204,6 +204,35 @@ tr.tunnel .c-status { color: var(--tunnel); }
 .headers td { padding: 2px 8px 2px 0; vertical-align: top; border: 0; white-space: normal; }
 .headers .hk { color: var(--accent); white-space: nowrap; }
 .headers .hv { color: var(--fg); word-break: break-all; }
+.headers .hcopy { width: 1%; padding-right: 0; text-align: right; }
+
+/* copy affordances */
+.pane-tools { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 14px; }
+.tool {
+  padding: 4px 10px;
+  background: var(--bg-alt);
+  color: var(--fg);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+}
+.tool:hover { background: var(--bg-hover); border-color: var(--accent); }
+.copy-btn {
+  visibility: hidden;
+  padding: 0 6px;
+  background: none;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1.6;
+}
+.headers tr:hover .copy-btn { visibility: visible; }
+.copy-btn:hover { color: var(--fg); border-color: var(--accent); }
+.copy-btn.copied, .tool.copied { color: var(--ok); border-color: var(--ok); }
 
 pre.body {
   margin: 0;

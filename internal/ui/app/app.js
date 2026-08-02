@@ -7,6 +7,7 @@
 const flows = new Map();   // id -> metadata flow, as received
 const order = [];          // ids, newest first
 let selected = null;
+let detailData = null;     // the full detail of the selected flow, for copy actions
 
 const el = {
   rows: document.getElementById("rows"),
@@ -117,6 +118,7 @@ async function select(id) {
 }
 
 function renderDetail(d) {
+  detailData = d; // stash for the copy actions handled in wiring
   const f = d.flow;
   const meta = f.error
     ? `<span class="err">ERROR: ${esc(f.error)}</span>`
@@ -136,18 +138,25 @@ function renderDetail(d) {
   if (hasResponse) html += `<button class="tab" data-tab="res" role="tab">Response</button>`;
   html += `</div>`;
 
-  html += `<div class="tabpane" data-pane="req">${pane(f.request_headers, d.request)}</div>`;
+  const reqTools =
+    `<button class="tool" data-act="curl">Copy as cURL</button>` +
+    `<button class="tool" data-act="req-headers">Copy headers</button>` +
+    `<button class="tool" data-act="req-body">Copy body</button>`;
+  html += `<div class="tabpane" data-pane="req">${pane(f.request_headers, d.request, reqTools)}</div>`;
   if (hasResponse) {
-    html += `<div class="tabpane hidden" data-pane="res">${pane(f.response_headers, d.response)}</div>`;
+    const resTools =
+      `<button class="tool" data-act="res-headers">Copy headers</button>` +
+      `<button class="tool" data-act="res-body">Copy body</button>`;
+    html += `<div class="tabpane hidden" data-pane="res">${pane(f.response_headers, d.response, resTools)}</div>`;
   }
   el.detail.innerHTML = html;
 }
 
-// pane renders one side (request or response): its headers, then its body, each
-// under a small heading — the content the old collapsible folders held, now flat
-// inside a tab.
-function pane(headers, body) {
+// pane renders one side (request or response): a copy toolbar, its headers, then
+// its body — the content the old collapsible folders held, now flat inside a tab.
+function pane(headers, body, toolbar) {
   return (
+    `<div class="pane-tools">${toolbar}</div>` +
     `<h4 class="d-h">Headers</h4>${headersTable(headers)}` +
     `<h4 class="d-h">Body<span class="meta">${bodyMeta(body)}</span></h4>${bodyInner(body)}`
   );
@@ -158,7 +167,10 @@ function headersTable(headers) {
   if (!keys.length) return `<p class="binary">none</p>`;
   let rows = "";
   for (const k of keys) for (const v of headers[k]) {
-    rows += `<tr><td class="hk">${esc(k)}</td><td class="hv">${esc(v)}</td></tr>`;
+    // data-copy carries the raw value so one click grabs e.g. the Authorization
+    // token without selecting text by hand.
+    rows += `<tr><td class="hk">${esc(k)}</td><td class="hv">${esc(v)}</td>` +
+      `<td class="hcopy"><button class="copy-btn" data-copy="${esc(v)}" title="Copy value">⧉</button></td></tr>`;
   }
   return `<table class="headers">${rows}</table>`;
 }
@@ -215,6 +227,93 @@ function base64Bytes(b64) {
 
 function esc(s) {
   return String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+}
+
+// ---- copy actions -----------------------------------------------------------
+// Per-header value copy (grab an auth token in one click) plus per-tab toolbar
+// actions: reconstruct the request as a runnable curl, or copy headers/bodies.
+
+async function copyText(text, btn) {
+  if (!text) return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch {
+    // Fallback for the rare non-secure context (loopback is normally fine).
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.style.position = "fixed";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand("copy"); } finally { ta.remove(); }
+  }
+  flashCopied(btn);
+}
+
+// flashCopied gives a brief ✓ on the clicked button so the copy is visibly ack'd.
+function flashCopied(btn) {
+  if (!btn) return;
+  const prev = btn.dataset.label || btn.textContent;
+  btn.dataset.label = prev;
+  btn.textContent = "✓";
+  btn.classList.add("copied");
+  clearTimeout(btn._t);
+  btn._t = setTimeout(() => {
+    btn.textContent = prev;
+    btn.classList.remove("copied");
+  }, 1000);
+}
+
+// handleTool runs a toolbar copy action against the loaded detail.
+function handleTool(act, btn) {
+  if (!detailData) return;
+  const f = detailData.flow;
+  let text = "";
+  switch (act) {
+    case "curl": text = toCurl(f, detailData.request); break;
+    case "req-headers": text = headersText(f.request_headers); break;
+    case "req-body": text = bodyText(detailData.request); break;
+    case "res-headers": text = headersText(f.response_headers); break;
+    case "res-body": text = bodyText(detailData.response); break;
+  }
+  copyText(text, btn);
+}
+
+// toCurl reconstructs a runnable curl for the request: method, URL, every captured
+// header, and the body (as --data-raw) when it is textual.
+function toCurl(f, body) {
+  const parts = [`curl -X ${f.method} ${shq(`${f.scheme}://${f.host}${f.path}`)}`];
+  const headers = f.request_headers || {};
+  for (const k of Object.keys(headers).sort()) {
+    for (const v of headers[k]) parts.push(`-H ${shq(`${k}: ${v}`)}`);
+  }
+  const bt = bodyText(body);
+  if (bt) parts.push(`--data-raw ${shq(bt)}`);
+  return parts.join(" \\\n  ");
+}
+
+// shq single-quotes a string for a POSIX shell, escaping embedded quotes.
+function shq(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+// headersText renders headers as "Key: value" lines, sorted, one per value.
+function headersText(headers) {
+  const keys = Object.keys(headers || {}).sort();
+  const lines = [];
+  for (const k of keys) for (const v of headers[k]) lines.push(`${k}: ${v}`);
+  return lines.join("\n");
+}
+
+// bodyText decodes a body to text for copying, pretty-printing JSON to match the
+// detail view. Empty when there is nothing captured.
+function bodyText(b) {
+  if (!b || !b.raw_size || !b.data) return "";
+  let text = new TextDecoder().decode(base64Bytes(b.data));
+  if ((b.media_type || "").toLowerCase().includes("json")) {
+    try { text = JSON.stringify(JSON.parse(text), null, 2); } catch { /* copy as-is */ }
+  }
+  return text;
 }
 
 // ---- origin control (spec 011) ----------------------------------------------
@@ -325,13 +424,20 @@ el.rows.addEventListener("click", (e) => {
   const tr = e.target.closest("tr[data-id]");
   if (tr) select(Number(tr.dataset.id));
 });
-// Detail tabs: delegate on the pane so it survives each re-render.
+// Detail interactions: delegate on the pane so they survive each re-render.
 el.detail.addEventListener("click", (e) => {
+  const copyBtn = e.target.closest(".copy-btn");
+  if (copyBtn) { copyText(copyBtn.dataset.copy, copyBtn); return; }
+
+  const tool = e.target.closest(".tool");
+  if (tool) { handleTool(tool.dataset.act, tool); return; }
+
   const tab = e.target.closest(".tab");
-  if (!tab) return;
-  const name = tab.dataset.tab;
-  el.detail.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
-  el.detail.querySelectorAll(".tabpane").forEach((p) => p.classList.toggle("hidden", p.dataset.pane !== name));
+  if (tab) {
+    const name = tab.dataset.tab;
+    el.detail.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
+    el.detail.querySelectorAll(".tabpane").forEach((p) => p.classList.toggle("hidden", p.dataset.pane !== name));
+  }
 });
 el.filter.addEventListener("input", renderList);
 el.clear.addEventListener("click", () => {
