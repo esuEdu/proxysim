@@ -27,8 +27,9 @@ body { display: flex; flex-direction: column; }
 
 #bar {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
+  gap: 8px 12px;
   padding: 8px 12px;
   background: var(--bg-alt);
   border-bottom: 1px solid var(--line);
@@ -62,8 +63,9 @@ body { display: flex; flex-direction: column; }
 
 #control {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 12px;
+  gap: 8px 12px;
   padding: 7px 12px;
   background: var(--bg);
   border-bottom: 1px solid var(--line);
@@ -99,8 +101,11 @@ main {
   flex: 1;
   min-height: 0;
 }
-@media (max-width: 780px) {
-  main { grid-template-columns: 1fr; grid-template-rows: 1fr 1fr; }
+/* Stack list over detail when the window is narrow — e.g. sharing the screen with
+   the Simulator — so neither pane gets crushed into a horizontal-scrolling mess. */
+@media (max-width: 900px) {
+  main { grid-template-columns: 1fr; grid-template-rows: minmax(0, 1fr) minmax(0, 1fr); }
+  #list { border-right: 0; border-bottom: 1px solid var(--line); }
 }
 
 #list { overflow: auto; border-right: 1px solid var(--line); position: relative; }
@@ -159,16 +164,41 @@ tr.tunnel .c-status { color: var(--tunnel); }
 .d-sub .err { color: var(--err); }
 .d-sub .tunnel { color: var(--tunnel); }
 
-details { border: 1px solid var(--line); border-radius: 6px; margin-bottom: 10px; }
-details > summary {
-  cursor: pointer;
-  padding: 7px 10px;
-  font-weight: 600;
-  color: var(--fg);
-  user-select: none;
+.tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--line);
+  margin-bottom: 12px;
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 1;
 }
-details > summary .meta { color: var(--fg-dim); font-weight: 400; margin-left: 6px; }
-.d-body { padding: 0 10px 10px; }
+.tab {
+  padding: 7px 14px;
+  background: none;
+  border: 0;
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font: inherit;
+  font-weight: 600;
+}
+.tab:hover { color: var(--fg); }
+.tab.active { color: var(--accent); border-bottom-color: var(--accent); }
+.tabpane.hidden { display: none; }
+
+.d-h {
+  margin: 16px 0 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: .05em;
+  color: var(--fg-dim);
+}
+.d-h:first-child { margin-top: 0; }
+.d-h .meta { text-transform: none; letter-spacing: 0; font-weight: 400; }
 
 .headers { width: 100%; border-collapse: collapse; font-family: var(--mono); font-size: 12px; }
 .headers td { padding: 2px 8px 2px 0; vertical-align: top; border: 0; white-space: normal; }

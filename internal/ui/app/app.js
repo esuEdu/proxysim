@@ -127,17 +127,30 @@ function renderDetail(d) {
   let html = `<p class="d-title"><span class="method">${esc(f.method)}</span> ${esc(f.scheme)}://${esc(f.host)}${esc(f.path)}</p>`;
   html += `<p class="d-sub">#${f.id} · ${meta} · ${ms(f.duration_ns)} · ${new Date(f.started).toLocaleTimeString()}</p>`;
 
-  html += section("Request headers", headersTable(f.request_headers), true);
-  html += bodySection("Request body", d.request);
-  if (f.intercepted && !f.error) {
-    html += section("Response headers", headersTable(f.response_headers), true);
-    html += bodySection("Response body", d.response);
+  // Tabs instead of stacked collapsibles: Request is always present; Response only
+  // when there is one (intercepted, not errored). Panes are switched client-side —
+  // see the delegated click handler in wiring.
+  const hasResponse = f.intercepted && !f.error;
+  html += `<div class="tabs" role="tablist">`;
+  html += `<button class="tab active" data-tab="req" role="tab">Request</button>`;
+  if (hasResponse) html += `<button class="tab" data-tab="res" role="tab">Response</button>`;
+  html += `</div>`;
+
+  html += `<div class="tabpane" data-pane="req">${pane(f.request_headers, d.request)}</div>`;
+  if (hasResponse) {
+    html += `<div class="tabpane hidden" data-pane="res">${pane(f.response_headers, d.response)}</div>`;
   }
   el.detail.innerHTML = html;
 }
 
-function section(title, inner, open) {
-  return `<details ${open ? "open" : ""}><summary>${esc(title)}</summary><div class="d-body">${inner}</div></details>`;
+// pane renders one side (request or response): its headers, then its body, each
+// under a small heading — the content the old collapsible folders held, now flat
+// inside a tab.
+function pane(headers, body) {
+  return (
+    `<h4 class="d-h">Headers</h4>${headersTable(headers)}` +
+    `<h4 class="d-h">Body<span class="meta">${bodyMeta(body)}</span></h4>${bodyInner(body)}`
+  );
 }
 
 function headersTable(headers) {
@@ -150,9 +163,14 @@ function headersTable(headers) {
   return `<table class="headers">${rows}</table>`;
 }
 
-function bodySection(title, b) {
+// bodyMeta is the size/encoding summary shown beside the "Body" heading.
+function bodyMeta(b) {
   const codings = b.encodings && b.encodings.length ? ` · ${b.encodings.join(", ")}` : "";
-  const summary = `${title}<span class="meta">${humanBytes(b.raw_size)}${b.decoded ? " raw" : ""}${codings}</span>`;
+  return ` ${humanBytes(b.raw_size)}${b.decoded ? " raw" : ""}${codings}`;
+}
+
+// bodyInner is the body itself: the decoded content, or an empty/truncated note.
+function bodyInner(b) {
   let inner;
   if (!b.raw_size) {
     inner = b.truncated
@@ -163,7 +181,7 @@ function bodySection(title, b) {
   }
   if (b.partial && b.note) inner += `<p class="note">${esc(b.note)}</p>`;
   if (b.truncated && b.raw_size) inner += `<p class="note">captured ${humanBytes(b.raw_size)}, truncated at the cap</p>`;
-  return `<details open><summary>${summary}</summary><div class="d-body">${inner}</div></details>`;
+  return inner;
 }
 
 function renderBody(b) {
@@ -306,6 +324,14 @@ function updateScope() {
 el.rows.addEventListener("click", (e) => {
   const tr = e.target.closest("tr[data-id]");
   if (tr) select(Number(tr.dataset.id));
+});
+// Detail tabs: delegate on the pane so it survives each re-render.
+el.detail.addEventListener("click", (e) => {
+  const tab = e.target.closest(".tab");
+  if (!tab) return;
+  const name = tab.dataset.tab;
+  el.detail.querySelectorAll(".tab").forEach((t) => t.classList.toggle("active", t === tab));
+  el.detail.querySelectorAll(".tabpane").forEach((p) => p.classList.toggle("hidden", p.dataset.pane !== name));
 });
 el.filter.addEventListener("input", renderList);
 el.clear.addEventListener("click", () => {
