@@ -68,6 +68,12 @@ type Hub struct {
 	filter   *origin.Controller
 	listSims func(context.Context) ([]sim.Device, error)
 	listApps func(context.Context, string) ([]sim.App, error)
+
+	// Xcode auto-start toggle (spec 012), wired via SetArmedControl. Independent of
+	// the origin filter: it persists whether building in Xcode launches proxysim at
+	// all, so the flag outlives any single process and is read from disk here.
+	getArmed func() (bool, error)
+	setArmed func(bool) error
 }
 
 // New returns a Hub buffering the last history completed flows. A non-positive
@@ -140,6 +146,14 @@ func (h *Hub) SetControl(filter *origin.Controller, sims func(context.Context) (
 	h.listApps = apps
 }
 
+// SetArmedControl wires the "auto-start on Xcode build" toggle (spec 012) to the
+// on-disk armed flag. Called once at startup when the UI serves; without it the
+// /armed endpoints report that control is off, so the toggle stays hidden.
+func (h *Hub) SetArmedControl(get func() (bool, error), set func(bool) error) {
+	h.getArmed = get
+	h.setArmed = set
+}
+
 // Handler serves the app at /, the live SSE stream at /events, the buffered
 // history at /flows, one flow in full at /flows/{id}, and — when origin control is
 // wired — the simulator/app enumeration and the live filter (spec 011). The
@@ -154,6 +168,8 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("GET /sims/{udid}/apps", h.handleApps)
 	mux.HandleFunc("GET /filter", h.handleGetFilter)
 	mux.HandleFunc("PUT /filter", h.handleSetFilter)
+	mux.HandleFunc("GET /armed", h.handleGetArmed)
+	mux.HandleFunc("PUT /armed", h.handleSetArmed)
 	mux.Handle("GET /", h.app)
 	return mux
 }
@@ -272,6 +288,46 @@ func (h *Hub) handleSetFilter(w http.ResponseWriter, r *http.Request) {
 	f := origin.BuildFilter(body.OnlySim, body.Apps)
 	h.filter.Set(f)
 	writeJSON(w, toFilterJSON(f))
+}
+
+// armedJSON is the wire shape of the Xcode auto-start toggle, both directions.
+type armedJSON struct {
+	Armed bool `json:"armed"`
+}
+
+// handleGetArmed reports whether auto-start on Xcode build is enabled, so the
+// toggle reflects the persisted flag (including a second tab or a prior session).
+func (h *Hub) handleGetArmed(w http.ResponseWriter, r *http.Request) {
+	if h.getArmed == nil {
+		controlDisabled(w)
+		return
+	}
+	armed, err := h.getArmed()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, armedJSON{Armed: armed})
+}
+
+// handleSetArmed persists the toggle. The change takes effect on the next Xcode
+// build — the pre-action reads this same flag from disk — not on the running
+// session, so no proxy state changes here.
+func (h *Hub) handleSetArmed(w http.ResponseWriter, r *http.Request) {
+	if h.setArmed == nil {
+		controlDisabled(w)
+		return
+	}
+	var body armedJSON
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		http.Error(w, "invalid armed body", http.StatusBadRequest)
+		return
+	}
+	if err := h.setArmed(body.Armed); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, armedJSON{Armed: body.Armed})
 }
 
 // toFilterJSON renders a Filter for the wire, its bundle-id set as a sorted slice

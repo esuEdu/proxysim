@@ -84,6 +84,9 @@ body { display: flex; flex-direction: column; }
 }
 #control select:focus { outline: none; border-color: var(--accent); }
 .scope { flex: 1; color: var(--accent); font-variant-numeric: tabular-nums; }
+.ctl-armed { cursor: pointer; user-select: none; white-space: nowrap; }
+.ctl-armed input { cursor: pointer; margin: 0; }
+.ctl-armed[hidden] { display: none; }
 #sim-refresh {
   padding: 4px 10px;
   background: var(--bg-alt);

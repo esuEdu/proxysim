@@ -56,6 +56,8 @@ and click one for its headers and decoded bodies.
 | `-trust` | `false` | install the CA into the booted simulator's trust store, then exit |
 | `-trust-set` | — | simulator set to target (e.g. `previews` for Xcode Previews) |
 | `-device` | — | UDID of the booted simulator, when several are booted |
+| `-xcode-run` | `false` | launched from an Xcode scheme Run pre-action: start (or retarget) a session scoped to the built app + simulator when armed; a no-op when disarmed (macOS) |
+| `-print-xcode-hook` | `false` | print the scheme Run pre-action snippet to paste into Xcode once, then exit |
 
 On startup proxysim auto-trusts the CA in the booted simulator (idempotent,
 best-effort — a missing simulator or Xcode just prints a skip line). `-no-trust`
@@ -122,6 +124,36 @@ the app process. Two things it does **not** catch: `WKWebView` traffic (it runs 
 WebKit's networking process, not your app — use *All simulator traffic* to see
 it), and any background session that egresses through a shared daemon. macOS only.
 
+### Start it from Xcode (no command to type)
+
+You can have proxysim launch itself when you build, already scoped to the app and
+simulator Xcode is running — no terminal, no device/app picker. Xcode has no
+supported way to dock a panel inside its window, so this works by having a scheme
+Run pre-action launch the standalone app; the proxysim UI opens in your browser.
+
+**One-time setup** — paste the pre-action into your scheme:
+
+```bash
+./proxysim -print-xcode-hook     # copy the two lines it prints
+```
+
+In Xcode: **Product → Scheme → Edit Scheme → Run → Pre-actions → + New Run Script
+Action**, pick your target under *Provide build settings from*, and paste. This is
+pasted once; nothing to type per build.
+
+**Arm / disarm.** The pre-action is a **no-op until you arm it**, so pasting it
+never changes your normal builds. Open the proxysim UI once and tick **Auto-start
+on Xcode build** (top-right of the control bar). While armed, building launches
+proxysim scoped to that app on that simulator; untick it and builds are untouched
+again. The setting persists on disk, so it survives across sessions.
+
+**Teardown is guaranteed.** When the app leaves the simulator — the run ends, is
+cancelled, fails to build, or crashes — a watchdog restores the system proxy and
+exits. Xcode does not run scheme *post*-actions on a cancelled/failed run, so this
+never relies on one; and if proxysim itself is killed, the next launch recovers the
+proxy from the on-disk snapshot (same net as `-system-proxy`). A second build
+retargets the running instance instead of starting a duplicate. macOS only.
+
 ### The manual path (fallback)
 
 If you'd rather drive the system proxy yourself (or you're not on the primary
@@ -182,6 +214,7 @@ and pass.
 | 009 | Origin filtering (simulator / per-app) | done |
 | 010 | Frictionless launch (system proxy + CA auto-trust) | done |
 | 011 | UI-driven simulator/app origin control | done |
+| 012 | Xcode build integration (armed auto-launch, auto-target, teardown) | done |
 
 Each spec carries a human-run manual criterion (real simulator, real browser)
 that the automated tests do not cover; those are yours to exercise via the steps

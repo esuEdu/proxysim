@@ -23,6 +23,8 @@ const el = {
   app: document.getElementById("app-select"),
   scope: document.getElementById("scope"),
   simRefresh: document.getElementById("sim-refresh"),
+  armedCtl: document.getElementById("armed-ctl"),
+  armed: document.getElementById("armed"),
 };
 
 // ---- rendering the list -----------------------------------------------------
@@ -346,6 +348,33 @@ async function refreshControl() {
   reflectFilter(activeFilter);
 }
 
+// ---- Xcode auto-start toggle (spec 012) -------------------------------------
+// Independent of the origin filter above: it persists whether building in Xcode
+// launches proxysim at all. The flag lives on disk (read by the scheme pre-action
+// when no proxysim is running), so a change here takes effect on the next build,
+// not this session. Shown only when the server wires the control (/armed != 501).
+async function initArmed() {
+  let state;
+  try {
+    const res = await fetch("armed");
+    if (!res.ok) return; // 501 when not wired: leave the toggle hidden
+    state = await res.json();
+  } catch { return; }
+
+  el.armed.checked = !!state.armed;
+  el.armedCtl.hidden = false;
+  el.armed.addEventListener("change", async () => {
+    try {
+      const res = await fetch("armed", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ armed: el.armed.checked }),
+      });
+      if (res.ok) el.armed.checked = !!(await res.json()).armed;
+    } catch { /* leave the checkbox as the user left it */ }
+  });
+}
+
 async function loadSims() {
   let sims = [];
   try { sims = await (await fetch("sims")).json(); } catch { /* keep empty */ }
@@ -471,3 +500,4 @@ function connect() {
 
 loadHistory().then(connect);
 initControl();
+initArmed();

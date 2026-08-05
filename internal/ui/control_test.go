@@ -113,6 +113,43 @@ func TestAppsEndpoint(t *testing.T) {
 	}
 }
 
+// Spec 012: GET /armed reflects the persisted flag; PUT /armed toggles it via the
+// wired setter. The endpoint drives the on-disk flag, so a change here is what a
+// later Xcode build reads — the handler just round-trips the boolean.
+func TestArmedGetAndPut(t *testing.T) {
+	armed := false
+	h := New(10)
+	h.SetArmedControl(
+		func() (bool, error) { return armed, nil },
+		func(on bool) error { armed = on; return nil },
+	)
+	srv := httptest.NewServer(h.Handler())
+	t.Cleanup(srv.Close)
+
+	var got struct {
+		Armed bool `json:"armed"`
+	}
+	getJSON(t, srv.URL+"/armed", &got)
+	if got.Armed {
+		t.Fatalf("GET /armed initially = %v, want false", got.Armed)
+	}
+
+	if status := putRaw(t, srv.URL+"/armed", `{"armed":true}`); status != http.StatusOK {
+		t.Fatalf("PUT /armed = %d, want 200", status)
+	}
+	if !armed {
+		t.Fatal("PUT /armed did not persist through the setter")
+	}
+	getJSON(t, srv.URL+"/armed", &got)
+	if !got.Armed {
+		t.Fatalf("GET /armed after enable = %v, want true", got.Armed)
+	}
+
+	if status := putRaw(t, srv.URL+"/armed", `{not json`); status != http.StatusBadRequest {
+		t.Fatalf("malformed armed body = %d, want 400", status)
+	}
+}
+
 // Criterion 9: the control endpoints are a capability of the UI server only. A Hub
 // with control unwired reports "not enabled" (501), so the endpoints never leak
 // interception control onto a server that did not opt in.
@@ -120,7 +157,7 @@ func TestControlEndpointsDisabledWithoutSetControl(t *testing.T) {
 	srv := httptest.NewServer(New(10).Handler()) // no SetControl
 	t.Cleanup(srv.Close)
 
-	for _, path := range []string{"/filter", "/sims", "/sims/AAAA/apps"} {
+	for _, path := range []string{"/filter", "/sims", "/sims/AAAA/apps", "/armed"} {
 		resp, err := http.Get(srv.URL + path)
 		if err != nil {
 			t.Fatal(err)
