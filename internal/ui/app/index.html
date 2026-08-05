@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>proxysim</title>
+  <link rel="stylesheet" href="app.css">
+</head>
+<body>
+  <header id="bar">
+    <span class="brand">proxysim</span>
+    <input id="filter" type="search" placeholder="filter host / path / method / status" autocomplete="off">
+    <span id="count" class="count">0 flows</span>
+    <span id="dropped" class="dropped" hidden></span>
+    <span id="status" class="conn" title="event stream">●</span>
+    <button id="clear" type="button">Clear</button>
+  </header>
+
+  <div id="control" hidden>
+    <label class="ctl">Simulator
+      <select id="sim-select"><option value="">no booted simulator</option></select>
+    </label>
+    <label class="ctl">Intercept
+      <select id="app-select">
+        <option value="__all__">Everything (no filter)</option>
+        <option value="__sim__">All simulator traffic</option>
+      </select>
+    </label>
+    <span id="scope" class="scope"></span>
+    <button id="sim-refresh" type="button" title="reload simulators and apps">↻</button>
+  </div>
+
+  <main>
+    <section id="list" aria-label="captured flows">
+      <table>
+        <thead>
+          <tr>
+            <th class="c-id">#</th>
+            <th class="c-method">Method</th>
+            <th class="c-host">Host</th>
+            <th class="c-path">Path</th>
+            <th class="c-status">Status</th>
+            <th class="c-time">Time</th>
+            <th class="c-size">↑</th>
+            <th class="c-size">↓</th>
+          </tr>
+        </thead>
+        <tbody id="rows"></tbody>
+      </table>
+      <p id="empty" class="empty">Waiting for traffic through the proxy…</p>
+    </section>
+
+    <section id="detail" aria-label="flow detail">
+      <p class="empty">Select a flow to inspect its headers and bodies.</p>
+    </section>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
