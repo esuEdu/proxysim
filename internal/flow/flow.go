@@ -58,3 +58,10 @@ var lastID atomic.Uint64
 func NextID() uint64 {
 	return lastID.Add(1)
 }
+
+// LastID reports how many IDs have been handed out, which is how many flows this
+// process has started. Read-only on purpose: the control API wants the count, and
+// calling NextID to get it would both answer the question and consume an ID.
+func LastID() uint64 {
+	return lastID.Load()
+}

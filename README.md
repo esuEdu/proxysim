@@ -3,9 +3,10 @@
 A local HTTP/HTTPS forward proxy and traffic sniffer for the iOS Simulator.
 Charles/Proxyman in miniature, built to be understood rather than to be complete.
 
-**Status:** specs 001–011 implemented. Proxy, TLS interception, body decoding,
+**Status:** specs 001–013 implemented. Proxy, TLS interception, body decoding,
 `simctl` trust automation, a live web UI, origin filtering, automatic system-proxy
-takeover, and in-UI simulator/app selection all work end-to-end.
+takeover, in-UI simulator/app selection, Xcode build integration, and a control
+API for host applications all work end-to-end.
 
 ## Quick start
 
@@ -58,6 +59,8 @@ and click one for its headers and decoded bodies.
 | `-device` | — | UDID of the booted simulator, when several are booted |
 | `-xcode-run` | `false` | launched from an Xcode scheme Run pre-action: start (or retarget) a session scoped to the built app + simulator when armed; a no-op when disarmed (macOS) |
 | `-print-xcode-hook` | `false` | print the scheme Run pre-action snippet to paste into Xcode once, then exit |
+| `-control-socket` | — | path to a Unix socket serving the control API; empty disables it |
+| `-exit-with-parent` | `false` | exit cleanly when the process that launched proxysim is gone |
 
 On startup proxysim auto-trusts the CA in the booted simulator (idempotent,
 best-effort — a missing simulator or Xcode just prints a skip line). `-no-trust`
@@ -226,3 +229,53 @@ Loopback only, one developer, one machine. It decrypts TLS, which is only
 acceptable because it is local and explicit. See the security section of
 `CLAUDE.md` before changing anything about how it binds or where the CA key
 lives.
+
+## Control API
+
+For driving proxysim from another application — a menu bar app, a script, a CI
+step — rather than a terminal. Off unless `-control-socket` is passed, and no
+socket file is created without it.
+
+```bash
+proxysim -control-socket ~/.proxysim/api.sock
+```
+
+A Unix socket rather than a loopback port because this API can stop the process
+and re-trust a CA: a TCP port is reachable by every process on the machine with no
+way to tell them apart, while the socket is created `0600` and restricted by the
+filesystem. It is plain HTTP, so no client library is needed:
+
+```bash
+curl --unix-socket ~/.proxysim/api.sock http://localhost/status
+curl --unix-socket ~/.proxysim/api.sock http://localhost/stats
+curl -X POST --unix-socket ~/.proxysim/api.sock http://localhost/reload
+curl -X POST --unix-socket ~/.proxysim/api.sock http://localhost/shutdown
+```
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /status` | port, uptime, active connections, total flows, the scope actually in force. A small, stable contract — fields may be added, never renamed. |
+| `GET /stats` | every counter. Explicitly *not* stable; adding one must never require a client change. |
+| `POST /reload` | re-read `ca.crt`/`ca.key` and re-install simulator trust. Does not reload flags — port and scope are read at launch. |
+| `POST /shutdown` | `202`, then the same graceful shutdown as Ctrl-C, so the system-proxy restore still runs. |
+
+`/reload` is the one worth knowing about: trust does not survive `simctl erase`,
+and this puts it back without restarting or dropping a connection. A trust failure
+comes back as `200` with a `trustError` field rather than a `500`, because trust
+installation is best-effort — no booted simulator is not a failure when the proxy
+is still perfectly useful for `curl`.
+
+### Not leaving orphans
+
+`-exit-with-parent` makes proxysim exit when the process that launched it is gone.
+Worth passing whenever proxysim is a child process, because an orphan keeps the
+proxy port bound and may still hold the system-proxy takeover — leaving a Mac
+routing traffic at a dead listener, which looks like a broken network rather than
+a proxy that stopped.
+
+It is opt-in rather than automatic: run from a terminal, proxysim's parent is your
+shell, and exiting when the shell dies would change `nohup`, `&`, and
+`ssh`-disconnect behaviour. It is also a no-op when proxysim is started already
+orphaned (launchd, a double fork) — there is no parent to outlive.
+
+See `specs/013-control-api.md`.

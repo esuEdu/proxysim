@@ -28,13 +28,19 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 	// never surfaced as a flow, unlike an excluded host which is shown as
 	// tunnelled. Decided here, before the host matters.
 	if !s.originAllows(r) {
+		defer s.counters.enterTunnel(false)()
 		s.tunnel(w, hostPort, "", false)
 		return
 	}
 	if s.shouldTunnel(hostPort) {
+		defer s.counters.enterTunnel(false)()
 		s.tunnel(w, hostPort, "", true)
 		return
 	}
+	// Counted as intercepted on the strength of the attempt, not the outcome: a
+	// host that turns out to be pinned is learned and tunnels on its *next*
+	// connection, which is when the split becomes accurate anyway.
+	defer s.counters.enterTunnel(true)()
 	s.intercept(w, hostPort)
 }
 
@@ -42,7 +48,7 @@ func (s *Server) handleConnect(w http.ResponseWriter, r *http.Request) {
 // when there is no CA to mint leaves, when it matches a configured exclusion, or
 // when interception was already observed to fail for it.
 func (s *Server) shouldTunnel(hostPort string) bool {
-	if s.authority == nil {
+	if s.Authority() == nil {
 		return true
 	}
 	host := hostname(hostPort)
@@ -70,6 +76,17 @@ func (s *Server) learn(hostPort string) {
 // decrypted requests. If the client rejects our certificate — the signature of a
 // pinned app — the host is remembered so the next connection tunnels.
 func (s *Server) intercept(w http.ResponseWriter, hostPort string) {
+	// Read the CA once, up front, and before hijacking: POST /reload can swap it
+	// (spec 013), and taking it here means this connection uses one consistent CA
+	// rather than risking a nil read further down. Nil is only reachable if it was
+	// swapped out between shouldTunnel and here, and because we have not hijacked
+	// yet the connection is still rescuable as an ordinary tunnel.
+	authority := s.Authority()
+	if authority == nil {
+		s.tunnel(w, hostPort, "no CA available to intercept", true)
+		return
+	}
+
 	started := time.Now()
 	conn, err := hijack(w)
 	if err != nil {
@@ -81,7 +98,7 @@ func (s *Server) intercept(w http.ResponseWriter, hostPort string) {
 		return
 	}
 
-	cfg := s.authority.TLSConfigFor(hostPort)
+	cfg := authority.TLSConfigFor(hostPort)
 	// Force HTTP/1.1: we cannot yet parse an intercepted h2 stream (out of scope).
 	cfg.NextProtos = []string{"http/1.1"}
 

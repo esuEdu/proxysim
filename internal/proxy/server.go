@@ -12,6 +12,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"proxysim/internal/ca"
@@ -45,7 +46,13 @@ type Server struct {
 
 	// authority mints leaves for TLS termination. When nil, the server cannot
 	// intercept, so every CONNECT is blind-tunnelled.
-	authority *ca.Authority
+	//
+	// An atomic pointer rather than a plain field because the control API's
+	// POST /reload swaps in a freshly-loaded CA on a live server (spec 013), and
+	// this is read from the request path on every CONNECT. Atomic rather than
+	// folded into mu because the read is on the hot path and the write happens
+	// once in a blue moon.
+	authority atomic.Pointer[ca.Authority]
 
 	// excluded holds user-configured host suffixes that are always tunnelled.
 	excluded []string
@@ -63,6 +70,10 @@ type Server struct {
 	// first failed interception a host lands here and is tunnelled thereafter.
 	mu      sync.RWMutex
 	learned map[string]struct{}
+
+	// counters feeds the control API's /status and /stats (spec 013). Atomics, not
+	// mutex-guarded: every field is touched from the request path.
+	counters counters
 }
 
 // Option configures a Server.
@@ -121,10 +132,9 @@ func WithUpstreamTLS(cfg *tls.Config) Option {
 // in which case CONNECT requests are always tunnelled rather than intercepted.
 func New(sink flow.Sink, authority *ca.Authority, opts ...Option) *Server {
 	s := &Server{
-		sink:      sink,
-		bodyCap:   flow.DefaultBodyCap,
-		authority: authority,
-		learned:   make(map[string]struct{}),
+		sink:    sink,
+		bodyCap: flow.DefaultBodyCap,
+		learned: make(map[string]struct{}),
 		transport: &http.Transport{
 			DialContext: (&net.Dialer{
 				Timeout:   30 * time.Second,
@@ -139,10 +149,25 @@ func New(sink flow.Sink, authority *ca.Authority, opts ...Option) *Server {
 			DisableCompression: true,
 		},
 	}
+	s.authority.Store(authority)
 	for _, o := range opts {
 		o(s)
 	}
 	return s
+}
+
+// Authority returns the CA currently in force, or nil when interception is off.
+// Read per connection so a reload takes effect on the next CONNECT rather than
+// needing a restart.
+func (s *Server) Authority() *ca.Authority {
+	return s.authority.Load()
+}
+
+// SetAuthority swaps in a reloaded CA. Connections already established keep the
+// leaf they negotiated — a TLS session cannot change its certificate mid-stream —
+// so the change applies from the next CONNECT onward.
+func (s *Server) SetAuthority(authority *ca.Authority) {
+	s.authority.Store(authority)
 }
 
 // ServeHTTP dispatches by request shape: CONNECT starts a tunnel or an
@@ -160,6 +185,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	// A cleartext request from a filtered-out process is forwarded so it still
 	// works, but not captured — host traffic flows, unshown (spec 009).
+	// Counted here rather than at the top of ServeHTTP so a malformed request that
+	// never reaches upstream is not reported as a connection in flight.
+	defer s.counters.enterRequest()()
 	s.forward(w, r, "http", s.originAllows(r))
 }
 

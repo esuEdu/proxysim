@@ -18,14 +18,17 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"proxysim/internal/ca"
+	"proxysim/internal/control"
 	"proxysim/internal/flow"
 	"proxysim/internal/origin"
+	"proxysim/internal/parent"
 	"proxysim/internal/proxy"
 	"proxysim/internal/sim"
 	"proxysim/internal/sysproxy"
@@ -50,6 +53,8 @@ func main() {
 	noTrust := flag.Bool("no-trust", false, "do not auto-trust the CA in the booted simulator on startup")
 	xcodeRun := flag.Bool("xcode-run", false, "launched from an Xcode scheme Run pre-action: if armed, start (or retarget) a session scoped to the built app+simulator; a no-op when disarmed (macOS only)")
 	printHook := flag.Bool("print-xcode-hook", false, "print the scheme Run pre-action snippet to paste into Xcode once, then exit")
+	controlSocket := flag.String("control-socket", "", "path to a Unix socket serving the control API (GET /status, GET /stats, POST /reload, POST /shutdown); empty disables it")
+	exitWithParent := flag.Bool("exit-with-parent", false, "exit cleanly when the process that launched proxysim is gone, so a host app cannot leave an orphan holding the port")
 	flag.Parse()
 
 	// -print-xcode-hook is a one-shot: emit the snippet (pointing at this binary's
@@ -86,6 +91,9 @@ func main() {
 		systemProxy: *systemProxy,
 		noTrust:     *noTrust,
 		xcodeRun:    *xcodeRun,
+
+		controlSocket:  *controlSocket,
+		exitWithParent: *exitWithParent,
 	}
 	if err := run(cfg); err != nil {
 		log.Fatalf("proxysim: %v", err)
@@ -109,6 +117,11 @@ type config struct {
 	systemProxy bool
 	noTrust     bool
 	xcodeRun    bool
+
+	// controlSocket and exitWithParent are spec 013's host-integration pair. Both
+	// default to off so a terminal run behaves exactly as it did before that spec.
+	controlSocket  string
+	exitWithParent bool
 }
 
 // xcodeState is the serving instance's live Xcode session: the control socket that
@@ -289,6 +302,93 @@ func setupSystemProxy(dir string, port int) (func() error, error) {
 	return restore, nil
 }
 
+// scopeLabel renders the origin filter in force as something a host app can show a
+// user. Read through the same accessor the proxy uses, so what is displayed is what
+// is actually being applied — including a change made at runtime through the UI
+// (spec 011).
+func scopeLabel(current func() origin.Filter) string {
+	if current == nil {
+		return "All traffic"
+	}
+	f := current()
+	if !f.Active() {
+		return "All traffic"
+	}
+	if len(f.Apps) > 0 {
+		// Sorted, because map iteration order is random and a label that reshuffles
+		// itself between two one-second polls looks like the scope is changing.
+		apps := make([]string, 0, len(f.Apps))
+		for app := range f.Apps {
+			apps = append(apps, app)
+		}
+		sort.Strings(apps)
+		return "Apps: " + strings.Join(apps, ", ")
+	}
+	return "iOS Simulator"
+}
+
+// controlHandlers wires the control API to the live server. Everything it needs
+// arrives as a closure so internal/control stays free of proxysim's internals.
+func controlHandlers(
+	srv *proxy.Server,
+	dir string,
+	cfg config,
+	uptime func() time.Duration,
+	scope func() string,
+	shutdown func(),
+) control.Handlers {
+	return control.Handlers{
+		Status: func() control.Status {
+			stats := srv.Stats()
+			return control.Status{
+				Port:              cfg.port,
+				UptimeSeconds:     uptime().Seconds(),
+				ActiveConnections: stats.Active(),
+				TotalFlows:        stats.TotalRequests + stats.TotalTunnels,
+				Scope:             scope(),
+			}
+		},
+		Stats: func() any {
+			// The dump carries uptime alongside the counters so one request answers
+			// "how busy, for how long" without correlating two endpoints.
+			return struct {
+				UptimeSeconds float64 `json:"uptimeSeconds"`
+				proxy.Stats
+				FlowsEmitted uint64 `json:"flowsEmitted"`
+			}{
+				UptimeSeconds: uptime().Seconds(),
+				Stats:         srv.Stats(),
+				FlowsEmitted:  flow.LastID(),
+			}
+		},
+		Reload: func(ctx context.Context) (control.ReloadResult, error) {
+			// ca.Load reads an existing CA and generates one only when absent, so this
+			// picks up a regenerated CA as well as re-reading the current one.
+			authority, err := ca.Load(dir)
+			if err != nil {
+				return control.ReloadResult{}, err
+			}
+			srv.SetAuthority(authority)
+
+			result := control.ReloadResult{Reloaded: true, Fingerprint: authority.Fingerprint()}
+
+			// Trust is best-effort, exactly as at startup (spec 010): no booted
+			// simulator is not a failure, because the proxy is still useful for curl.
+			// So it is reported in a field, not as a 500.
+			if !cfg.noTrust {
+				if err := sim.InstallRootCert(
+					ctx, sim.ExecRunner, filepath.Join(dir, "ca.crt"), cfg.trustSet, cfg.device,
+				); err != nil {
+					result.TrustError = err.Error()
+				}
+			}
+			fmt.Fprintf(os.Stderr, "proxysim: CA reloaded (%s)\n", authority.Fingerprint())
+			return result, nil
+		},
+		Shutdown: shutdown,
+	}
+}
+
 func run(cfg config) error {
 	dir, err := expandPath(cfg.caDir)
 	if err != nil {
@@ -329,6 +429,7 @@ func run(cfg config) error {
 	if err != nil {
 		return fmt.Errorf("listening on %s: %w", addr, err)
 	}
+	servingSince := time.Now()
 
 	// Take over the macOS system proxy so the user does not touch System Settings,
 	// and — the part that matters — put it back on exit. The takeover routes every
@@ -423,7 +524,66 @@ func run(cfg config) error {
 
 	srv := &http.Server{Handler: handler}
 
+	// Spec 013's host integration. controlDone and parentGone join the same select
+	// as SIGINT below, so every shutdown route runs the identical graceful path —
+	// which is what fires the deferred system-proxy restore. A shutdown that skipped
+	// it would leave the Mac pointed at a dead listener.
+	controlDone := make(chan struct{})
+	var controlOnce sync.Once
+	triggerShutdown := func() { controlOnce.Do(func() { close(controlDone) }) }
+
+	var controlSrv *control.Server
+	if cfg.controlSocket != "" {
+		var filterFunc func() origin.Filter
+		if controller != nil {
+			filterFunc = controller.Current
+		} else if seed.Active() {
+			// No UI, so the flag-built filter is fixed for the process. Captured by
+			// value so the label reports what is actually in force.
+			fixed := seed
+			filterFunc = func() origin.Filter { return fixed }
+		}
+
+		// Uptime is measured from when the listener was bound, not from when the
+		// control server was created, so it answers "how long has traffic been
+		// served" — which is the question a host app's UI is really asking.
+		controlSrv, err = control.Listen(cfg.controlSocket, controlHandlers(
+			handler, dir, cfg,
+			func() time.Duration { return time.Since(servingSince) },
+			func() string { return scopeLabel(filterFunc) },
+			triggerShutdown,
+		))
+		if err != nil {
+			return err
+		}
+		defer controlSrv.Close()
+	}
+
+	// Parent-death detection. Opt-in, because a terminal proxysim's parent is the
+	// shell: exiting when the shell dies would change nohup and ssh-disconnect
+	// behaviour for every existing user.
+	parentGone := make(chan struct{})
+	if cfg.exitWithParent {
+		ppid := os.Getppid()
+		if parent.ShouldWatch(ppid) {
+			watchCtx, cancelWatch := context.WithCancel(context.Background())
+			defer cancelWatch()
+			go func() {
+				parent.Watch(watchCtx, ppid, os.Getppid, parent.DefaultPoll)
+				close(parentGone)
+			}()
+		} else {
+			// Started orphaned (launchd, nohup, a double fork). There is no parent to
+			// outlive, and saying so beats silently doing nothing.
+			fmt.Fprintln(os.Stderr, "proxysim: -exit-with-parent ignored: no parent process to watch")
+		}
+	}
+
 	printBanner(addr, dir, authority)
+	if controlSrv != nil {
+		fmt.Fprintf(os.Stderr, "Control:     %s\n", controlSrv.Path())
+		fmt.Fprintf(os.Stderr, "             curl --unix-socket %s http://localhost/status\n\n", controlSrv.Path())
+	}
 	if uiLn != nil {
 		fmt.Fprintf(os.Stderr, "UI:          http://%s\n\n", uiLn.Addr())
 		// An Xcode-launched session opens the UI for the user — the whole flow stays
@@ -452,6 +612,13 @@ func run(cfg config) error {
 			}
 		}()
 	}
+	if controlSrv != nil {
+		go func() {
+			if err := controlSrv.Serve(); err != nil {
+				errCh <- fmt.Errorf("serving control API: %w", err)
+			}
+		}()
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -475,6 +642,13 @@ func run(cfg config) error {
 		return err
 	case <-ctx.Done():
 		return shutdown("shutting down")
+	case <-controlDone:
+		return shutdown("shutdown requested over the control API")
+	case <-parentGone:
+		// The host app that launched us is gone. Exiting here rather than lingering
+		// is the whole point: an orphan keeps the port bound and may still hold the
+		// system-proxy takeover.
+		return shutdown("parent process exited; shutting down")
 	case <-watchdogDone:
 		// The built app left the simulator: the run is over. Returning here fires the
 		// deferred system-proxy restore, so the takeover never outlives the run.
