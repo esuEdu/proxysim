@@ -161,9 +161,7 @@ func (h *Hub) SetArmedControl(get func() (bool, error), set func(bool) error) {
 // runs, so the same handler works with or without control.
 func (h *Hub) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("GET /events", h.handleEvents)
-	mux.HandleFunc("GET /flows", h.handleFlows)
-	mux.HandleFunc("GET /flows/{id}", h.handleDetail)
+	h.registerFlowRoutes(mux)
 	mux.HandleFunc("GET /sims", h.handleSims)
 	mux.HandleFunc("GET /sims/{udid}/apps", h.handleApps)
 	mux.HandleFunc("GET /filter", h.handleGetFilter)
@@ -172,6 +170,28 @@ func (h *Hub) Handler() http.Handler {
 	mux.HandleFunc("PUT /armed", h.handleSetArmed)
 	mux.Handle("GET /", h.app)
 	return mux
+}
+
+// FlowHandler serves only the flow endpoints — history, per-flow detail, and the
+// live SSE stream — with no web app, no origin control, and no Xcode toggle.
+//
+// It exists so a second listener can serve flows from this same Hub: the control
+// socket (spec 014) is a consumer of flows in exactly the way a browser is, and a
+// host application inspecting traffic should not require a web server to be
+// running. One Hub feeds both, so there is one ring and one id space — a flow id
+// seen on either listener resolves on the other.
+func (h *Hub) FlowHandler() http.Handler {
+	mux := http.NewServeMux()
+	h.registerFlowRoutes(mux)
+	return mux
+}
+
+// registerFlowRoutes is the single definition of the flow routes, so the web
+// handler and the control-socket handler cannot drift apart.
+func (h *Hub) registerFlowRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("GET /events", h.handleEvents)
+	mux.HandleFunc("GET /flows", h.handleFlows)
+	mux.HandleFunc("GET /flows/{id}", h.handleDetail)
 }
 
 // handleFlows returns the buffered history as metadata-only flows, newest first,

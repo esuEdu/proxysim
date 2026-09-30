@@ -4,7 +4,9 @@ import (
 	"bufio"
 	"bytes"
 	"compress/gzip"
+	"encoding/base64"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -379,3 +381,119 @@ func (s *streamConn) nextFlow(t *testing.T) flow.Flow {
 }
 
 func (s *streamConn) close() { s.res.Body.Close() }
+
+// TestFlowHandlerServesTheFlowRoutesOnly checks the seam spec 014 adds: the same
+// flow endpoints, without the web app or the control endpoints.
+func TestFlowHandlerServesTheFlowRoutesOnly(t *testing.T) {
+	h := New(10)
+	h.Emit(&flow.Flow{ID: 1, Method: "GET", Host: "example.com", Path: "/", StatusCode: 200})
+
+	srv := httptest.NewServer(h.FlowHandler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/flows")
+	if err != nil {
+		t.Fatalf("GET /flows: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET /flows = %d, want 200", resp.StatusCode)
+	}
+
+	// The web app must NOT be reachable here: a host app asking for an unknown path
+	// should get a 404, not an HTML page it cannot use.
+	rootResp, err := http.Get(srv.URL + "/")
+	if err != nil {
+		t.Fatalf("GET /: %v", err)
+	}
+	defer rootResp.Body.Close()
+	if rootResp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET / = %d, want 404 — FlowHandler must not serve the web app", rootResp.StatusCode)
+	}
+
+	// Nor the spec-011 control endpoints.
+	filterResp, err := http.Get(srv.URL + "/filter")
+	if err != nil {
+		t.Fatalf("GET /filter: %v", err)
+	}
+	defer filterResp.Body.Close()
+	if filterResp.StatusCode != http.StatusNotFound {
+		t.Errorf("GET /filter = %d, want 404", filterResp.StatusCode)
+	}
+}
+
+// TestBothHandlersShareOneRingAndIDSpace is spec 014's acceptance criterion 4: with
+// the web UI and the control socket both served from one Hub, a flow id seen on
+// either resolves on the other. Two rings would make an id from one listener a 404
+// on the other — the bug this exists to prevent.
+func TestBothHandlersShareOneRingAndIDSpace(t *testing.T) {
+	h := New(10)
+
+	web := httptest.NewServer(h.Handler())
+	defer web.Close()
+	control := httptest.NewServer(h.FlowHandler())
+	defer control.Close()
+
+	h.Emit(&flow.Flow{ID: 42, Method: "GET", Host: "example.com", Path: "/x", StatusCode: 200})
+
+	for name, base := range map[string]string{"web": web.URL, "control": control.URL} {
+		resp, err := http.Get(base + "/flows/42")
+		if err != nil {
+			t.Fatalf("%s GET /flows/42: %v", name, err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("%s GET /flows/42 = %d, want 200: %s", name, resp.StatusCode, body)
+		}
+		if !strings.Contains(string(body), "example.com") {
+			t.Errorf("%s detail did not carry the flow: %s", name, body)
+		}
+	}
+}
+
+// TestFlowListCarriesNoBodies pins spec 014's framing decision: a chatty session
+// would otherwise ship megabytes per second to a client rendering one-line rows.
+func TestFlowListCarriesNoBodies(t *testing.T) {
+	h := New(10)
+	h.Emit(&flow.Flow{
+		ID:           7,
+		Method:       "POST",
+		Host:         "example.com",
+		Path:         "/upload",
+		StatusCode:   200,
+		RequestBody:  []byte("SECRET-REQUEST-PAYLOAD"),
+		ResponseBody: []byte("SECRET-RESPONSE-PAYLOAD"),
+	})
+
+	srv := httptest.NewServer(h.FlowHandler())
+	defer srv.Close()
+
+	resp, err := http.Get(srv.URL + "/flows")
+	if err != nil {
+		t.Fatalf("GET /flows: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	// Checked in both plain and base64 form, since []byte marshals to base64 — a
+	// check for only the plain text would pass even if the body were shipped.
+	for _, secret := range []string{"SECRET-REQUEST-PAYLOAD", "SECRET-RESPONSE-PAYLOAD"} {
+		encoded := base64.StdEncoding.EncodeToString([]byte(secret))
+		if strings.Contains(string(body), secret) || strings.Contains(string(body), encoded) {
+			t.Errorf("/flows leaked a body (%s): %s", secret, body)
+		}
+	}
+
+	// The detail endpoint is where bodies live.
+	detail, err := http.Get(srv.URL + "/flows/7")
+	if err != nil {
+		t.Fatalf("GET /flows/7: %v", err)
+	}
+	defer detail.Body.Close()
+	detailBody, _ := io.ReadAll(detail.Body)
+	wantEncoded := base64.StdEncoding.EncodeToString([]byte("SECRET-REQUEST-PAYLOAD"))
+	if !strings.Contains(string(detailBody), wantEncoded) {
+		t.Errorf("/flows/7 should carry bodies: %s", detailBody)
+	}
+}

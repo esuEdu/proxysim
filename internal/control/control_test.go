@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -523,5 +524,195 @@ func TestCurlCompatibility(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("status = %d", resp.StatusCode)
+	}
+}
+
+// stubFlowHandler stands in for ui.Hub's flow routes, so the control server's
+// delegation is tested without importing internal/ui — the decoupling this package
+// is built around would be pointless if its tests broke it.
+func stubFlowHandler() http.Handler {
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /flows", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `[{"id":2},{"id":1}]`)
+	})
+	mux.HandleFunc("GET /flows/{id}", func(w http.ResponseWriter, r *http.Request) {
+		if r.PathValue("id") == "99" {
+			http.Error(w, "flow 99 not found", http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"id":%s,"request_body":"decoded"}`, r.PathValue("id"))
+	})
+	mux.HandleFunc("GET /events", func(w http.ResponseWriter, r *http.Request) {
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		flusher.Flush()
+		for i := 1; i <= 3; i++ {
+			fmt.Fprintf(w, "data: {\"id\":%d}\n\n", i)
+			flusher.Flush()
+		}
+		<-r.Context().Done()
+	})
+	return mux
+}
+
+func flowHandlers() Handlers {
+	h := fullHandlers(func() {})
+	h.Flows = stubFlowHandler()
+	return h
+}
+
+func TestFlowsAreDelegatedToTheInjectedHandler(t *testing.T) {
+	_, client, _ := serve(t, flowHandlers())
+
+	resp, err := client.Get("http://localhost/flows")
+	if err != nil {
+		t.Fatalf("GET /flows: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want 200", resp.StatusCode)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"id":2`) {
+		t.Errorf("body = %q", body)
+	}
+}
+
+func TestFlowDetailPathIsForwardedIntact(t *testing.T) {
+	// Registered on the "/flows/" prefix so the flow handler owns its own routing;
+	// a rewritten or stripped path would break its {id} pattern.
+	_, client, _ := serve(t, flowHandlers())
+
+	resp, err := client.Get("http://localhost/flows/7")
+	if err != nil {
+		t.Fatalf("GET /flows/7: %v", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if !strings.Contains(string(body), `"id":7`) {
+		t.Errorf("the id did not survive delegation: %q", body)
+	}
+}
+
+func TestUnknownFlowIDStillReports404ThroughTheControlSocket(t *testing.T) {
+	_, client, _ := serve(t, flowHandlers())
+
+	resp, err := client.Get("http://localhost/flows/99")
+	if err != nil {
+		t.Fatalf("GET /flows/99: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNotFound {
+		t.Errorf("status = %d, want 404", resp.StatusCode)
+	}
+}
+
+func TestEventsStreamsIncrementally(t *testing.T) {
+	// The point of SSE: frames arrive before the response ends. Reading to EOF would
+	// hang here, which is exactly the constraint the client has to respect.
+	_, client, _ := serve(t, flowHandlers())
+
+	req, _ := http.NewRequest(http.MethodGet, "http://localhost/events", nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	resp, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("GET /events: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if got := resp.Header.Get("Content-Type"); got != "text/event-stream" {
+		t.Errorf("Content-Type = %q, want text/event-stream", got)
+	}
+
+	// Read exactly the three frames the stub sends, then stop. The response is never
+	// finished, so this must not wait for one.
+	buffer := make([]byte, 0, 256)
+	chunk := make([]byte, 64)
+	deadline := time.Now().Add(4 * time.Second)
+	for strings.Count(string(buffer), "\n\n") < 3 && time.Now().Before(deadline) {
+		n, err := resp.Body.Read(chunk)
+		if n > 0 {
+			buffer = append(buffer, chunk[:n]...)
+		}
+		if err != nil {
+			break
+		}
+	}
+
+	for i := 1; i <= 3; i++ {
+		want := fmt.Sprintf(`data: {"id":%d}`, i)
+		if !strings.Contains(string(buffer), want) {
+			t.Errorf("missing frame %d in stream: %q", i, buffer)
+		}
+	}
+}
+
+func TestEventsIsNotCutOffByTheHeaderTimeout(t *testing.T) {
+	// ReadHeaderTimeout bounds only the request headers. If a write deadline were ever
+	// added, SSE would die mid-stream — this pins that it has not been.
+	_, client, _ := serve(t, flowHandlers())
+
+	req, _ := http.NewRequest(http.MethodGet, "http://localhost/events", nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	resp, err := client.Do(req.WithContext(ctx))
+	if err != nil {
+		t.Fatalf("GET /events: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Well past the 5s ReadHeaderTimeout, the stream must still be open.
+	time.Sleep(100 * time.Millisecond)
+	chunk := make([]byte, 64)
+	if _, err := resp.Body.Read(chunk); err != nil && err != io.EOF {
+		t.Errorf("stream broke early: %v", err)
+	}
+}
+
+func TestFlowRoutesReport501WhenNoFlowStoreIsWired(t *testing.T) {
+	// -control-socket without any flow consumer is a valid configuration, and a host
+	// app polling /flows deserves "not available here" rather than a 404 suggesting a
+	// typo.
+	_, client, _ := serve(t, fullHandlers(func() {}))
+
+	for _, path := range []string{"/flows", "/flows/1", "/events"} {
+		resp, err := client.Get("http://localhost" + path)
+		if err != nil {
+			t.Fatalf("GET %s: %v", path, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotImplemented {
+			t.Errorf("GET %s = %d, want 501", path, resp.StatusCode)
+		}
+	}
+}
+
+func TestNotFoundBodyListsTheFlowRoutes(t *testing.T) {
+	_, client, _ := serve(t, flowHandlers())
+
+	resp, err := client.Get("http://localhost/nope")
+	if err != nil {
+		t.Fatalf("GET /nope: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+
+	for _, route := range []string{"/flows", "/events"} {
+		if !strings.Contains(string(body), route) {
+			t.Errorf("404 body should list %s; got %q", route, body)
+		}
 	}
 }

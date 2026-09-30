@@ -3,7 +3,7 @@
 A local HTTP/HTTPS forward proxy and traffic sniffer for the iOS Simulator.
 Charles/Proxyman in miniature, built to be understood rather than to be complete.
 
-**Status:** specs 001–013 implemented. Proxy, TLS interception, body decoding,
+**Status:** specs 001–014 implemented. Proxy, TLS interception, body decoding,
 `simctl` trust automation, a live web UI, origin filtering, automatic system-proxy
 takeover, in-UI simulator/app selection, Xcode build integration, and a control
 API for host applications all work end-to-end.
@@ -258,6 +258,19 @@ curl -X POST --unix-socket ~/.proxysim/api.sock http://localhost/shutdown
 | `GET /stats` | every counter. Explicitly *not* stable; adding one must never require a client change. |
 | `POST /reload` | re-read `ca.crt`/`ca.key` and re-install simulator trust. Does not reload flags — port and scope are read at launch. |
 | `POST /shutdown` | `202`, then the same graceful shutdown as Ctrl-C, so the system-proxy restore still runs. |
+| `GET /flows` | buffered flow history, newest first, metadata only — no bodies. |
+| `GET /flows/{id}` | one flow in full, bodies decoded per spec 006. |
+| `GET /events` | SSE: one frame per completed flow, as it completes. |
+
+The traffic endpoints are the same ones the web UI serves, from the same ring —
+`-control-socket` builds the flow store whether or not `-ui` is on, so a host app
+gets live traffic without a web server running. One ring means one id space: an id
+seen on `/events` resolves on `/flows/{id}` from either listener. `-ui-history`
+sizes it.
+
+```bash
+curl --unix-socket ~/.proxysim/api.sock -N http://localhost/events
+```
 
 `/reload` is the one worth knowing about: trust does not survive `simctl erase`,
 and this puts it back without restarting or dropping a connection. A trust failure

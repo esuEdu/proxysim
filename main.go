@@ -463,8 +463,18 @@ func run(cfg config) error {
 	var uiSrv *http.Server
 	var uiLn net.Listener
 	var controller *origin.Controller
+
+	// One Hub, built whenever anything consumes flows — the web UI, the control
+	// socket, or both (spec 014). Both listeners then share one ring and one id
+	// space, so a flow id seen on either resolves on the other. With neither flag no
+	// Hub exists at all and the console remains the only consumer.
+	var hub *ui.Hub
+	if cfg.ui || cfg.controlSocket != "" {
+		hub = ui.New(cfg.uiHistory)
+		sink = flow.MultiSink{sink, hub}
+	}
+
 	if cfg.ui {
-		hub := ui.New(cfg.uiHistory)
 		controller = origin.NewController(seed)
 		hub.SetControl(controller, bootedDevices, installedApps)
 		// The auto-start toggle reads/writes the on-disk armed flag, so the change
@@ -473,7 +483,6 @@ func run(cfg config) error {
 			func() (bool, error) { return xcode.Armed(dir) },
 			func(on bool) error { return xcode.SetArmed(dir, on) },
 		)
-		sink = flow.MultiSink{sink, hub}
 		uiLn, err = ui.Listen(cfg.uiPort)
 		if err != nil {
 			return err
@@ -547,12 +556,19 @@ func run(cfg config) error {
 		// Uptime is measured from when the listener was bound, not from when the
 		// control server was created, so it answers "how long has traffic been
 		// served" — which is the question a host app's UI is really asking.
-		controlSrv, err = control.Listen(cfg.controlSocket, controlHandlers(
+		handlers := controlHandlers(
 			handler, dir, cfg,
 			func() time.Duration { return time.Since(servingSince) },
 			func() string { return scopeLabel(filterFunc) },
 			triggerShutdown,
-		))
+		)
+		// Traffic endpoints come from the same Hub the web UI uses, injected as a
+		// plain handler so internal/control still knows nothing about flows.
+		if hub != nil {
+			handlers.Flows = hub.FlowHandler()
+		}
+
+		controlSrv, err = control.Listen(cfg.controlSocket, handlers)
 		if err != nil {
 			return err
 		}
@@ -582,7 +598,8 @@ func run(cfg config) error {
 	printBanner(addr, dir, authority)
 	if controlSrv != nil {
 		fmt.Fprintf(os.Stderr, "Control:     %s\n", controlSrv.Path())
-		fmt.Fprintf(os.Stderr, "             curl --unix-socket %s http://localhost/status\n\n", controlSrv.Path())
+		fmt.Fprintf(os.Stderr, "             curl --unix-socket %s http://localhost/status\n", controlSrv.Path())
+		fmt.Fprintf(os.Stderr, "             curl --unix-socket %s -N http://localhost/events\n\n", controlSrv.Path())
 	}
 	if uiLn != nil {
 		fmt.Fprintf(os.Stderr, "UI:          http://%s\n\n", uiLn.Addr())

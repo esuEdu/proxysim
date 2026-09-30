@@ -76,6 +76,13 @@ type Handlers struct {
 	// it is called *before* the response is written, and the actual teardown belongs
 	// on another goroutine.
 	Shutdown func()
+
+	// Flows serves the traffic endpoints — GET /flows, GET /flows/{id},
+	// GET /events (spec 014). Injected as a plain http.Handler so this package
+	// still imports nothing from internal/ui: it mounts flows without knowing what
+	// a flow is. Nil means this instance has no flow store, and the routes answer
+	// 501 like any other unwired capability.
+	Flows http.Handler
 }
 
 // Server is the control API listening on a Unix socket.
@@ -235,11 +242,29 @@ func (s *Server) handler(h Handlers) http.Handler {
 		go h.Shutdown()
 	})
 
+	// Traffic endpoints, delegated wholesale. Registered on the prefixes rather than
+	// route-by-route so the flow handler owns its own routing and this package does
+	// not restate it — the two would drift.
+	if h.Flows != nil {
+		mux.Handle("/flows", h.Flows)
+		mux.Handle("/flows/", h.Flows)
+		// No timeout wrapper and no write deadline here: /events is Server-Sent
+		// Events, an HTTP response that is deliberately never finished.
+		mux.Handle("/events", h.Flows)
+	} else {
+		for _, path := range []string{"/flows", "/flows/", "/events"} {
+			mux.HandleFunc(path, func(w http.ResponseWriter, r *http.Request) {
+				unavailable(w, "flow streaming")
+			})
+		}
+	}
+
 	// A 404 body that names the real routes saves the next person a source dive.
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		http.Error(
 			w,
-			"proxysim control API: GET /status, GET /stats, POST /reload, POST /shutdown",
+			"proxysim control API: GET /status, GET /stats, GET /flows, GET /flows/{id}, "+
+				"GET /events, POST /reload, POST /shutdown",
 			http.StatusNotFound,
 		)
 	})
